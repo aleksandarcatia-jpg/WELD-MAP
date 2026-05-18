@@ -38,17 +38,12 @@ Sub CATMain()
         Exit Sub
     End If
 
-    Dim defaultPosition
-    defaultPosition = UCase(Trim(InputBox("Default welding position for all missing positions:" & vbCrLf & _
-                                          "PA / PB / PC / PD / PE / PF / PG", _
-                                          MACRO_NAME, "PB")))
-    If defaultPosition = "" Then defaultPosition = "PB"
-
     Dim report
     Set report = NewList()
     ListAdd report, "CATIA Weld Design register build"
     ListAdd report, "Active document: " & SafeDocumentName(doc)
-    ListAdd report, "Default welding position: " & defaultPosition
+    ListAdd report, "Workflow: CATIA Weld Design -> Assembly Joints -> weld_design_register.csv"
+    ListAdd report, "WPS matching: disabled in this first automatic register version"
     ListAdd report, ""
 
     Dim productMap
@@ -69,7 +64,7 @@ Sub CATMain()
     End If
 
     Dim wpsRows
-    Set wpsRows = LoadWpsLibrary(doc, report)
+    Set wpsRows = Nothing
 
     Dim sortedIndexes
     sortedIndexes = SortedNumericKeys(jointRecords)
@@ -84,7 +79,7 @@ Sub CATMain()
         idx = CStr(sortedIndexes(i))
         Set rec = jointRecords.Item(idx)
 
-        Call CompleteJointRecord(doc, rec, productMap, defaultPosition, wpsRows)
+        Call CompleteJointRecord(doc, rec, productMap, "", wpsRows)
         csvRows.Add RecordToCsvValues(rec)
     Next
 
