@@ -1,0 +1,1625 @@
+Option Explicit
+
+' ---------------------------------------------------------------------------
+' ListWeldDesignObjects_DeepDebug.CATScript
+'
+' Deep debug macro for CATIA V5 Weld Design / Assembly Joint investigation.
+' This macro does not assign weld IDs, does not edit the model and does not
+' create drawing tables. Its only purpose is to discover where CATIA exposes
+' useful Weld Design data.
+' ---------------------------------------------------------------------------
+
+Const MACRO_NAME = "ListWeldDesignObjects_DeepDebug"
+Const REPORT_FILE_NAME = "weld_design_objects_deep_debug.txt"
+
+Sub CATMain()
+    Dim doc
+    Set doc = Nothing
+
+    On Error Resume Next
+    Set doc = CATIA.ActiveDocument
+    On Error GoTo 0
+
+    If doc Is Nothing Then
+        MsgBox "Open CATProduct and run this macro again.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    If TypeName(doc) <> "ProductDocument" Then
+        MsgBox "Active document must be CATProduct.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim buckets
+    Set buckets = CreateObject("Scripting.Dictionary")
+    buckets.CompareMode = 1
+    Call InitBuckets(buckets)
+
+    Call AddCandidatesFromSelectionSearch(doc, buckets)
+    Call AddCandidatesFromProductTree(doc.Product, buckets)
+
+    Dim reportLines
+    Set reportLines = NewList()
+
+    ListAdd reportLines, "CATIA Weld Design deep debug scan"
+    ListAdd reportLines, "Active document: " & SafeDocumentName(doc)
+    ListAdd reportLines, "Report goal:"
+    ListAdd reportLines, "  1. Where CATIA stores Weld Design data"
+    ListAdd reportLines, "  2. Whether Part A / Part B can be read"
+    ListAdd reportLines, "  3. Whether Weld Symbol can be linked to Assembly Joint"
+    ListAdd reportLines, "  4. Whether weld size and weld length can be read"
+    ListAdd reportLines, "  5. Whether Weld Symbol annotations can be reused for W001 labels"
+    ListAdd reportLines, ""
+
+    Call AppendBucketSummary(reportLines, buckets)
+    Call AppendCandidateLists(reportLines, buckets)
+    Call AppendAssemblyJointDeepDebug(reportLines, "SPEC ASSEMBLY JOINTS", Bucket(buckets, "SPEC"))
+    Call AppendAssemblyJointDeepDebug(reportLines, "MATERIAL ASSEMBLY JOINTS", Bucket(buckets, "MATERIAL"))
+    Call AppendWeldSymbolDeepDebug(reportLines, Bucket(buckets, "SYMBOL"))
+    Call AppendWeldShapeDeepDebug(reportLines, doc, Bucket(buckets, "SHAPE"))
+    Call AppendDetectedLinks(reportLines, buckets)
+    Call AppendIgnoredNoise(reportLines, Bucket(buckets, "NOISE"))
+    Call AppendFinalSummary(reportLines, buckets)
+
+    Dim reportPath
+    reportPath = WriteReportFile(doc, reportLines)
+
+    Dim candidateCount
+    candidateCount = Bucket(buckets, "SPEC").Count + Bucket(buckets, "MATERIAL").Count + _
+                     Bucket(buckets, "SYMBOL").Count + Bucket(buckets, "SHAPE").Count
+
+    If candidateCount = 0 Then
+        MsgBox "No Weld Design weld objects found. Use WELD_MAP fallback workflow." & vbCrLf & _
+               "Report: " & reportPath, vbExclamation, MACRO_NAME
+    Else
+        MsgBox "Deep debug complete." & vbCrLf & _
+               "Candidate Weld Design objects: " & CStr(candidateCount) & vbCrLf & _
+               "Report: " & reportPath, vbInformation, MACRO_NAME
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------
+' Collection buckets
+' ---------------------------------------------------------------------------
+
+Sub InitBuckets(buckets)
+    buckets.Add "SPEC", NewDictionary()
+    buckets.Add "MATERIAL", NewDictionary()
+    buckets.Add "SYMBOL", NewDictionary()
+    buckets.Add "SHAPE", NewDictionary()
+    buckets.Add "OTHER", NewDictionary()
+    buckets.Add "NOISE", NewDictionary()
+End Sub
+
+Function Bucket(buckets, name)
+    Set Bucket = buckets.Item(CStr(name))
+End Function
+
+Function NewDictionary()
+    Dim d
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+    Set NewDictionary = d
+End Function
+
+Function NewList()
+    Set NewList = CreateObject("System.Collections.ArrayList")
+End Function
+
+Sub ListAdd(listObj, textValue)
+    listObj.Add CStr(textValue)
+End Sub
+
+' ---------------------------------------------------------------------------
+' Scanning
+' ---------------------------------------------------------------------------
+
+Sub AddCandidatesFromSelectionSearch(doc, buckets)
+    Dim queries
+    queries = Array( _
+        "Name=*Weld Symbol*,all", _
+        "Name=*Weld*Symbol*,all", _
+        "Name=*Assembly Joint*,all", _
+        "Name=*Assembly*Joint*,all", _
+        "Name=*Weld*Shape*,all", _
+        "Name=*Weld.*,all", _
+        "Name=*Weld*,all", _
+        "Name=*WELD*,all", _
+        "Name=*weld*,all", _
+        "Name=*Joint*,all", _
+        "Name=*JOINT*,all", _
+        "Name=*Seam*,all", _
+        "Name=*Welding*,all", _
+        "Type=Annotation,all", _
+        "Type=Body,all", _
+        "Type=AssemblyJoint,all", _
+        "Type=Assembly Joint,all", _
+        "Type=Joint,all")
+
+    Dim i
+    For i = LBound(queries) To UBound(queries)
+        Call AddCandidatesFromSearchQuery(doc, buckets, CStr(queries(i)))
+    Next
+End Sub
+
+Sub AddCandidatesFromSearchQuery(doc, buckets, query)
+    Dim sel
+    Set sel = Nothing
+
+    On Error Resume Next
+    Set sel = doc.Selection
+    If sel Is Nothing Then
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    sel.Clear
+    Err.Clear
+    sel.Search CStr(query)
+
+    If Err.Number = 0 Then
+        Dim countValue
+        Dim i
+        Dim obj
+
+        countValue = SelectionCount(sel)
+        For i = 1 To countValue
+            Set obj = SelectionItemValue(sel, i)
+            If Not obj Is Nothing Then Call AddScannedObject(buckets, obj)
+        Next
+    End If
+
+    Err.Clear
+    sel.Clear
+    On Error GoTo 0
+End Sub
+
+Sub AddCandidatesFromProductTree(product, buckets)
+    If product Is Nothing Then Exit Sub
+
+    Call AddScannedObject(buckets, product)
+
+    Dim children
+    Set children = Nothing
+
+    On Error Resume Next
+    Set children = product.Products
+    On Error GoTo 0
+
+    If children Is Nothing Then Exit Sub
+
+    Dim i
+    Dim child
+    For i = 1 To children.Count
+        Set child = Nothing
+        On Error Resume Next
+        Set child = children.Item(i)
+        On Error GoTo 0
+
+        If Not child Is Nothing Then Call AddCandidatesFromProductTree(child, buckets)
+    Next
+End Sub
+
+Sub AddScannedObject(buckets, obj)
+    Dim category
+    category = ObjectCategory(obj)
+
+    If category = "" Then Exit Sub
+
+    Dim key
+    key = CandidateKey(obj)
+    If key = "" Then Exit Sub
+
+    If Not Bucket(buckets, category).Exists(key) Then Bucket(buckets, category).Add key, obj
+End Sub
+
+Function ObjectCategory(obj)
+    Dim nameValue
+    Dim typeValue
+    Dim pathValue
+    Dim weldTypeValue
+
+    nameValue = UCase(ObjectName(obj))
+    typeValue = UCase(ObjectTypeName(obj))
+    pathValue = UCase(ParentPath(obj, 8))
+    weldTypeValue = UCase(ProbeScalarValue(obj, "WeldType"))
+
+    ObjectCategory = ""
+
+    If IsNoiseObject(nameValue, typeValue, pathValue) Then
+        ObjectCategory = "NOISE"
+        Exit Function
+    End If
+
+    If InStr(nameValue, "WELD SYMBOL") > 0 Then
+        ObjectCategory = "SYMBOL"
+        Exit Function
+    End If
+
+    If typeValue = "ANNOTATION" And (InStr(nameValue, "WELD") > 0 Or InStr(weldTypeValue, "FTA_WELD") > 0) Then
+        ObjectCategory = "SYMBOL"
+        Exit Function
+    End If
+
+    If InStr(nameValue, "ASSEMBLY JOINT") > 0 Or InStr(nameValue, "ASSEMBLYJOINT") > 0 Then
+        If InStr(nameValue, "SPEC_") > 0 Then
+            ObjectCategory = "SPEC"
+        ElseIf InStr(nameValue, "MATERIAL_") > 0 Then
+            ObjectCategory = "MATERIAL"
+        Else
+            ObjectCategory = "OTHER"
+        End If
+        Exit Function
+    End If
+
+    If LooksLikeWeldShape(nameValue, typeValue) Then
+        ObjectCategory = "SHAPE"
+        Exit Function
+    End If
+
+    If InStr(nameValue, "WELD") > 0 Or InStr(typeValue, "WELD") > 0 Or InStr(nameValue, "JOINT") > 0 Then
+        ObjectCategory = "OTHER"
+        Exit Function
+    End If
+End Function
+
+Function IsNoiseObject(nameValue, typeValue, pathValue)
+    IsNoiseObject = False
+
+    If InStr(nameValue, "SHEET METAL PARAMETER") > 0 Then IsNoiseObject = True
+    If InStr(pathValue, "SHEET METAL PARAMETER") > 0 Then IsNoiseObject = True
+    If InStr(nameValue, "\WELD") > 0 Or InStr(nameValue, "\BEAD") > 0 Then IsNoiseObject = True
+
+    If typeValue = "PRODUCT" Then
+        If InStr(nameValue, "WELD") > 0 And InStr(nameValue, "ASSEMBLY JOINT") = 0 And InStr(nameValue, "ASSEMBLYJOINT") = 0 Then
+            If InStr(pathValue, "PRODUCTDOCUMENT") > 0 Then IsNoiseObject = True
+        End If
+    End If
+End Function
+
+Function LooksLikeWeldShape(nameValue, typeValue)
+    LooksLikeWeldShape = False
+
+    If InStr(nameValue, "WELD.") > 0 And InStr(nameValue, " SHAPE") > 0 Then LooksLikeWeldShape = True
+    If InStr(nameValue, "WELD") > 0 And InStr(nameValue, "SHAPE") > 0 And typeValue = "BODY" Then LooksLikeWeldShape = True
+End Function
+
+Function CandidateKey(obj)
+    CandidateKey = UCase(ObjectTypeName(obj) & "|" & ObjectName(obj) & "|" & ParentPath(obj, 12))
+End Function
+
+' ---------------------------------------------------------------------------
+' Report sections
+' ---------------------------------------------------------------------------
+
+Sub AppendBucketSummary(reportLines, buckets)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "SUMMARY OF CLASSIFICATION"
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "Candidate Weld Design objects:"
+    ListAdd reportLines, "  Spec Assembly Joint objects: " & CStr(Bucket(buckets, "SPEC").Count)
+    ListAdd reportLines, "  Material Assembly Joint objects: " & CStr(Bucket(buckets, "MATERIAL").Count)
+    ListAdd reportLines, "  Weld Shape bodies: " & CStr(Bucket(buckets, "SHAPE").Count)
+    ListAdd reportLines, "  Weld Symbol annotations: " & CStr(Bucket(buckets, "SYMBOL").Count)
+    ListAdd reportLines, "  Other weld/joint candidates: " & CStr(Bucket(buckets, "OTHER").Count)
+    ListAdd reportLines, "Ignored / noise objects: " & CStr(Bucket(buckets, "NOISE").Count)
+    ListAdd reportLines, ""
+End Sub
+
+Sub AppendCandidateLists(reportLines, buckets)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "A) CANDIDATE WELD DESIGN OBJECTS"
+    ListAdd reportLines, "============================================================"
+    Call AppendSimpleObjectList(reportLines, "Spec_*Assembly Joint*", Bucket(buckets, "SPEC"))
+    Call AppendSimpleObjectList(reportLines, "Material_*Assembly Joint*", Bucket(buckets, "MATERIAL"))
+    Call AppendSimpleObjectList(reportLines, "Weld.* Shape", Bucket(buckets, "SHAPE"))
+    Call AppendSimpleObjectList(reportLines, "Weld Symbol.*", Bucket(buckets, "SYMBOL"))
+    Call AppendSimpleObjectList(reportLines, "Other weld/joint candidates", Bucket(buckets, "OTHER"))
+    ListAdd reportLines, ""
+End Sub
+
+Sub AppendSimpleObjectList(reportLines, title, dict)
+    ListAdd reportLines, title & " count: " & CStr(dict.Count)
+
+    If dict.Count = 0 Then
+        ListAdd reportLines, "  <none>"
+        Exit Sub
+    End If
+
+    Dim key
+    Dim obj
+    For Each key In dict.Keys
+        Set obj = dict.Item(key)
+        ListAdd reportLines, "  - " & ObjectName(obj) & " [" & ObjectTypeName(obj) & "] | Parent: " & ParentPath(obj, 4)
+    Next
+End Sub
+
+Sub AppendAssemblyJointDeepDebug(reportLines, title, dict)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, title
+    ListAdd reportLines, "============================================================"
+
+    If dict.Count = 0 Then
+        ListAdd reportLines, "<none>"
+        ListAdd reportLines, ""
+        Exit Sub
+    End If
+
+    Dim key
+    Dim obj
+    Dim idx
+    idx = 0
+
+    For Each key In dict.Keys
+        idx = idx + 1
+        Set obj = dict.Item(key)
+
+        ListAdd reportLines, "------------------------------------------------------------"
+        ListAdd reportLines, title & " #" & CStr(idx)
+        ListAdd reportLines, "Name: " & ObjectName(obj)
+        ListAdd reportLines, "TypeName: " & ObjectTypeName(obj)
+        ListAdd reportLines, "Parent: " & ParentPath(obj, 12)
+        ListAdd reportLines, "Document full path: " & FindDocumentFullPath(obj)
+        ListAdd reportLines, "Trailing index: " & ExtractTrailingIndex(ObjectName(obj))
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Product / reference properties:"
+        Call AppendProbeAny(reportLines, obj, "PartNumber")
+        Call AppendProbeAny(reportLines, obj, "Nomenclature")
+        Call AppendProbeAny(reportLines, obj, "DescriptionRef")
+        Call AppendProbeAny(reportLines, obj, "Revision")
+        Call AppendProbeAny(reportLines, obj, "Definition")
+        Call AppendProbeAny(reportLines, obj, "Source")
+        Call AppendProbeAny(reportLines, obj, "DescriptionInst")
+        Call AppendProbeAny(reportLines, obj, "InstanceName")
+        Call AppendProbeAny(reportLines, obj, "ReferenceProduct")
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Possible Part A / Part B:"
+        ListAdd reportLines, "  Part A: " & EmptyAsNotAccessible(CandidatePartA(obj))
+        ListAdd reportLines, "  Part B: " & EmptyAsNotAccessible(CandidatePartB(obj))
+        ListAdd reportLines, "  Part references from parent path: " & ParentPath(obj, 12)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Possible weld values:"
+        ListAdd reportLines, "  Weld type: " & EmptyAsNotAccessible(CandidateWeldType(obj))
+        ListAdd reportLines, "  Weld size: " & EmptyAsNotAccessible(CandidateWeldSize(obj))
+        ListAdd reportLines, "  Weld length: " & EmptyAsNotAccessible(CandidateWeldLength(obj))
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "UserRefProperties:"
+        Call AppendCollectionByProperty(reportLines, obj, "UserRefProperties", 200)
+        Call AppendReferenceProductCollectionByProperty(reportLines, obj, "UserRefProperties", 200)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "All Parameters:"
+        Call AppendParametersFromObjectAndRelatives(reportLines, obj, 300)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "All Relations:"
+        Call AppendRelationsFromObjectAndRelatives(reportLines, obj, 200)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "All Publications:"
+        Call AppendPublicationsFromObjectAndRelatives(reportLines, obj, 200)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "All Bodies / HybridBodies / Shape names:"
+        Call AppendPartGeometryFromObject(reportLines, obj)
+        ListAdd reportLines, ""
+    Next
+End Sub
+
+Sub AppendWeldSymbolDeepDebug(reportLines, dict)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "WELD SYMBOL ANNOTATIONS"
+    ListAdd reportLines, "============================================================"
+
+    If dict.Count = 0 Then
+        ListAdd reportLines, "<none>"
+        ListAdd reportLines, ""
+        Exit Sub
+    End If
+
+    Dim key
+    Dim obj
+    Dim idx
+    idx = 0
+
+    For Each key In dict.Keys
+        idx = idx + 1
+        Set obj = dict.Item(key)
+
+        ListAdd reportLines, "------------------------------------------------------------"
+        ListAdd reportLines, "Weld Symbol #" & CStr(idx)
+        ListAdd reportLines, "Name: " & ObjectName(obj)
+        ListAdd reportLines, "TypeName: " & ObjectTypeName(obj)
+        ListAdd reportLines, "Parent: " & ParentPath(obj, 12)
+        ListAdd reportLines, "Annotation set name: " & ObjectName(ObjectParent(obj))
+        ListAdd reportLines, "Trailing index: " & ExtractTrailingIndex(ObjectName(obj))
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Probe properties / accessible fields:"
+        Call AppendProbeAny(reportLines, obj, "Name")
+        Call AppendProbeAny(reportLines, obj, "WeldType")
+        Call AppendProbeAny(reportLines, obj, "Type")
+        Call AppendProbeAny(reportLines, obj, "Subtype")
+        Call AppendProbeAny(reportLines, obj, "Text")
+        Call AppendProbeAny(reportLines, obj, "TextString")
+        Call AppendProbeAny(reportLines, obj, "String")
+        Call AppendProbeAny(reportLines, obj, "Value")
+        Call AppendProbeAny(reportLines, obj, "Size")
+        Call AppendProbeAny(reportLines, obj, "PrimarySize")
+        Call AppendProbeAny(reportLines, obj, "PrimaryWeldSize")
+        Call AppendProbeAny(reportLines, obj, "PrimarySymbol")
+        Call AppendProbeAny(reportLines, obj, "Symbol")
+        Call AppendProbeAny(reportLines, obj, "Angle")
+        Call AppendProbeAny(reportLines, obj, "Orientation")
+        Call AppendProbeAny(reportLines, obj, "X")
+        Call AppendProbeAny(reportLines, obj, "Y")
+        Call AppendProbeAny(reportLines, obj, "Z")
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Accessible text fields:"
+        Call AppendCollectionByProperty(reportLines, obj, "Texts", 50)
+        Call AppendCollectionByProperty(reportLines, obj, "Text", 50)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Accessible leaders:"
+        Call AppendCollectionByProperty(reportLines, obj, "Leaders", 50)
+        Call AppendProbeAny(reportLines, obj, "Leader")
+        Call AppendProbeAny(reportLines, obj, "LeaderTarget")
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Associated geometry / references:"
+        Call AppendProbeAny(reportLines, obj, "AssociatedElement")
+        Call AppendProbeAny(reportLines, obj, "Reference")
+        Call AppendProbeAny(reportLines, obj, "Target")
+        Call AppendProbeAny(reportLines, obj, "LinkedObject")
+        Call AppendProbeAny(reportLines, obj, "Support")
+        Call AppendProbeAny(reportLines, obj, "Geometry")
+        Call AppendProbeAny(reportLines, obj, "Anchor")
+        Call AppendProbeAny(reportLines, obj, "Annotation")
+        Call AppendProbeAny(reportLines, obj, "AnnotationSet")
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "All Parameters:"
+        Call AppendParametersFromObjectAndRelatives(reportLines, obj, 200)
+        ListAdd reportLines, ""
+    Next
+End Sub
+
+Sub AppendWeldShapeDeepDebug(reportLines, doc, dict)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "WELD SHAPE BODIES"
+    ListAdd reportLines, "============================================================"
+
+    If dict.Count = 0 Then
+        ListAdd reportLines, "<none>"
+        ListAdd reportLines, ""
+        Exit Sub
+    End If
+
+    Dim key
+    Dim obj
+    Dim idx
+    idx = 0
+
+    For Each key In dict.Keys
+        idx = idx + 1
+        Set obj = dict.Item(key)
+
+        ListAdd reportLines, "------------------------------------------------------------"
+        ListAdd reportLines, "Weld Shape #" & CStr(idx)
+        ListAdd reportLines, "Name: " & ObjectName(obj)
+        ListAdd reportLines, "TypeName: " & ObjectTypeName(obj)
+        ListAdd reportLines, "Parent: " & ParentPath(obj, 12)
+        ListAdd reportLines, "Document full path: " & FindDocumentFullPath(obj)
+        ListAdd reportLines, "Trailing index: " & ExtractTrailingIndex(ObjectName(obj))
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Contained shapes / sub-elements:"
+        Call AppendCollectionByProperty(reportLines, obj, "Shapes", 200)
+        Call AppendCollectionByProperty(reportLines, obj, "HybridShapes", 200)
+        Call AppendCollectionByProperty(reportLines, obj, "Sketches", 100)
+        Call AppendCollectionByProperty(reportLines, obj, "Bodies", 100)
+        Call AppendCollectionByProperty(reportLines, obj, "HybridBodies", 100)
+        ListAdd reportLines, ""
+
+        ListAdd reportLines, "Measurement attempts:"
+        ListAdd reportLines, "  Candidate length property/parameter: " & EmptyAsNotAccessible(CandidateWeldLength(obj))
+        ListAdd reportLines, "  SPAWorkbench length: " & EmptyAsNotAccessible(TryMeasureLength(doc, obj))
+        ListAdd reportLines, "  Bounding box / centroid: " & EmptyAsNotAccessible(TryBoundingBoxOrCentroid(doc, obj))
+        ListAdd reportLines, ""
+    Next
+End Sub
+
+Sub AppendDetectedLinks(reportLines, buckets)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "DETECTED LINKS"
+    ListAdd reportLines, "============================================================"
+
+    Dim symbols
+    Dim specs
+    Dim materials
+    Dim shapes
+    Set symbols = Bucket(buckets, "SYMBOL")
+    Set specs = Bucket(buckets, "SPEC")
+    Set materials = Bucket(buckets, "MATERIAL")
+    Set shapes = Bucket(buckets, "SHAPE")
+
+    If symbols.Count = 0 And specs.Count = 0 And materials.Count = 0 And shapes.Count = 0 Then
+        ListAdd reportLines, "<none>"
+        ListAdd reportLines, ""
+        Exit Sub
+    End If
+
+    Dim key
+    Dim sym
+    Dim idx
+    Dim specObj
+    Dim materialObj
+    Dim shapeObj
+
+    ListAdd reportLines, "Weld Symbol -> Assembly Joint ?"
+    For Each key In symbols.Keys
+        Set sym = symbols.Item(key)
+        idx = ExtractTrailingIndex(ObjectName(sym))
+        Set specObj = FindObjectByTrailingIndex(specs, idx)
+        Set materialObj = FindObjectByTrailingIndex(materials, idx)
+        Set shapeObj = FindObjectByTrailingIndex(shapes, idx)
+
+        ListAdd reportLines, "  " & ObjectName(sym) & " -> Spec: " & LinkName(specObj) & _
+                             " | Material: " & LinkName(materialObj) & _
+                             " | Shape: " & LinkName(shapeObj) & _
+                             " | method: trailing index / parent path heuristic"
+    Next
+
+    ListAdd reportLines, ""
+    ListAdd reportLines, "Spec Assembly Joint -> Material Assembly Joint ?"
+    For Each key In specs.Keys
+        Set specObj = specs.Item(key)
+        idx = ExtractTrailingIndex(ObjectName(specObj))
+        Set materialObj = FindObjectByTrailingIndex(materials, idx)
+        Set shapeObj = FindObjectByTrailingIndex(shapes, idx)
+        ListAdd reportLines, "  " & ObjectName(specObj) & " -> Material: " & LinkName(materialObj) & _
+                             " | Shape: " & LinkName(shapeObj) & _
+                             " | method: trailing index / parent path heuristic"
+    Next
+
+    ListAdd reportLines, ""
+    ListAdd reportLines, "Material Assembly Joint -> Weld Shape ?"
+    For Each key In materials.Keys
+        Set materialObj = materials.Item(key)
+        idx = ExtractTrailingIndex(ObjectName(materialObj))
+        Set shapeObj = FindObjectByTrailingIndex(shapes, idx)
+        ListAdd reportLines, "  " & ObjectName(materialObj) & " -> Shape: " & LinkName(shapeObj) & _
+                             " | method: trailing index / parent path heuristic"
+    Next
+
+    ListAdd reportLines, ""
+    ListAdd reportLines, "Note: these are detected links, not proof of CATIA associativity. If associated geometry properties above are accessible, they are more reliable than name matching."
+    ListAdd reportLines, ""
+End Sub
+
+Sub AppendIgnoredNoise(reportLines, dict)
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "B) IGNORED / NOISE"
+    ListAdd reportLines, "============================================================"
+
+    If dict.Count = 0 Then
+        ListAdd reportLines, "<none>"
+        ListAdd reportLines, ""
+        Exit Sub
+    End If
+
+    Dim key
+    Dim obj
+    For Each key In dict.Keys
+        Set obj = dict.Item(key)
+        ListAdd reportLines, "  - " & ObjectName(obj) & " [" & ObjectTypeName(obj) & "] | Parent: " & ParentPath(obj, 6)
+    Next
+    ListAdd reportLines, ""
+End Sub
+
+Sub AppendFinalSummary(reportLines, buckets)
+    Dim symbols
+    Dim specs
+    Dim materials
+    Dim shapes
+
+    Set symbols = Bucket(buckets, "SYMBOL")
+    Set specs = Bucket(buckets, "SPEC")
+    Set materials = Bucket(buckets, "MATERIAL")
+    Set shapes = Bucket(buckets, "SHAPE")
+
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "FINAL SUMMARY"
+    ListAdd reportLines, "============================================================"
+    ListAdd reportLines, "Total candidate weld symbols: " & CStr(symbols.Count)
+    ListAdd reportLines, "Total Assembly Joint spec parts: " & CStr(specs.Count)
+    ListAdd reportLines, "Total Assembly Joint material parts: " & CStr(materials.Count)
+    ListAdd reportLines, "Total Weld Shape bodies: " & CStr(shapes.Count)
+    ListAdd reportLines, "Symbols linked to assembly joints: " & CStr(CountSymbolsLinkedToAssemblyJoints(symbols, specs, materials))
+    ListAdd reportLines, "Assembly joints with readable PartA/PartB: " & CStr(CountAssemblyJointsWithPartAB(specs, materials))
+    ListAdd reportLines, "Assembly joints with readable weld size: " & CStr(CountAssemblyJointsWithValue(specs, materials, "SIZE"))
+    ListAdd reportLines, "Assembly joints with readable weld length: " & CStr(CountAssemblyJointsWithValue(specs, materials, "LENGTH"))
+    ListAdd reportLines, ""
+End Sub
+
+' ---------------------------------------------------------------------------
+' Candidate values
+' ---------------------------------------------------------------------------
+
+Function CandidatePartA(obj)
+    CandidatePartA = FirstNonEmpty(Array( _
+        ObjectDescriptionFromObjectProperty(obj, "PartA"), _
+        ObjectDescriptionFromObjectProperty(obj, "ConnectedPartA"), _
+        ObjectDescriptionFromObjectProperty(obj, "FirstPart"), _
+        ObjectDescriptionFromObjectProperty(obj, "Reference1"), _
+        ObjectDescriptionFromObjectProperty(obj, "Support1"), _
+        ObjectDescriptionFromObjectProperty(obj, "Element1"), _
+        ObjectDescriptionFromObjectProperty(obj, "Product1"), _
+        ObjectDescriptionFromObjectProperty(obj, "Component1"), _
+        ParameterValueByKeywords(obj, Array("PartA", "ConnectedPartA", "FirstPart", "Reference1", "Support1", "Element1"))))
+End Function
+
+Function CandidatePartB(obj)
+    CandidatePartB = FirstNonEmpty(Array( _
+        ObjectDescriptionFromObjectProperty(obj, "PartB"), _
+        ObjectDescriptionFromObjectProperty(obj, "ConnectedPartB"), _
+        ObjectDescriptionFromObjectProperty(obj, "SecondPart"), _
+        ObjectDescriptionFromObjectProperty(obj, "Reference2"), _
+        ObjectDescriptionFromObjectProperty(obj, "Support2"), _
+        ObjectDescriptionFromObjectProperty(obj, "Element2"), _
+        ObjectDescriptionFromObjectProperty(obj, "Product2"), _
+        ObjectDescriptionFromObjectProperty(obj, "Component2"), _
+        ParameterValueByKeywords(obj, Array("PartB", "ConnectedPartB", "SecondPart", "Reference2", "Support2", "Element2"))))
+End Function
+
+Function CandidateWeldType(obj)
+    CandidateWeldType = FirstNonEmpty(Array( _
+        ProbeScalarValue(obj, "WeldType"), _
+        ProbeScalarValue(obj, "Type"), _
+        ParameterValueByKeywords(obj, Array("WeldType", "Weld Type", "FTA_Weld", "JointType"))))
+End Function
+
+Function CandidateWeldSize(obj)
+    CandidateWeldSize = FirstNonEmpty(Array( _
+        ProbeScalarValue(obj, "WeldSize"), _
+        ProbeScalarValue(obj, "Size"), _
+        ProbeScalarValue(obj, "PrimarySize"), _
+        ProbeScalarValue(obj, "PrimaryWeldSize"), _
+        ProbeScalarValue(obj, "Throat"), _
+        ParameterValueByKeywords(obj, Array("WeldSize", "Weld Size", "PrimarySize", "Primary Weld Size", "Throat", "a", "GrooveDepth"))))
+End Function
+
+Function CandidateWeldLength(obj)
+    CandidateWeldLength = FirstNonEmpty(Array( _
+        ProbeScalarValue(obj, "WeldLength"), _
+        ProbeScalarValue(obj, "Length"), _
+        ParameterValueByKeywords(obj, Array("WeldLength", "Weld Length", "Length", "CurveLength"))))
+End Function
+
+Function ObjectDescriptionFromObjectProperty(obj, propertyName)
+    Dim refObj
+    Dim ok
+    Dim errText
+
+    Set refObj = ObjectProperty(obj, CStr(propertyName), ok, errText)
+    If ok And Not refObj Is Nothing Then
+        ObjectDescriptionFromObjectProperty = DescribeModelObject(refObj)
+    Else
+        ObjectDescriptionFromObjectProperty = ""
+    End If
+End Function
+
+Function ParameterValueByKeywords(obj, keywords)
+    ParameterValueByKeywords = ""
+
+    Dim collections
+    Set collections = NewList()
+    Call AddParameterCollections(obj, collections)
+
+    Dim c
+    Dim params
+    Dim value
+
+    For c = 0 To collections.Count - 1
+        Set params = collections.Item(c)
+        value = ParameterValueFromCollection(params, keywords)
+        If value <> "" Then
+            ParameterValueByKeywords = value
+            Exit Function
+        End If
+    Next
+End Function
+
+Function ParameterValueFromCollection(params, keywords)
+    ParameterValueFromCollection = ""
+
+    If params Is Nothing Then Exit Function
+
+    Dim i
+    Dim p
+    Dim pName
+    Dim k
+
+    On Error Resume Next
+    For i = 1 To params.Count
+        Set p = Nothing
+        Set p = params.Item(i)
+        If Err.Number = 0 And Not p Is Nothing Then
+            pName = NormalizeName(ObjectName(p))
+            For k = LBound(keywords) To UBound(keywords)
+                If InStr(pName, NormalizeName(CStr(keywords(k)))) > 0 Then
+                    ParameterValueFromCollection = ParameterDisplayValue(p)
+                    If ParameterValueFromCollection <> "" Then
+                        On Error GoTo 0
+                        Exit Function
+                    End If
+                End If
+            Next
+        End If
+        Err.Clear
+    Next
+    On Error GoTo 0
+End Function
+
+' ---------------------------------------------------------------------------
+' Deep collection reporting
+' ---------------------------------------------------------------------------
+
+Sub AppendParametersFromObjectAndRelatives(reportLines, obj, limit)
+    Dim collections
+    Set collections = NewList()
+    Call AddParameterCollections(obj, collections)
+
+    If collections.Count = 0 Then
+        ListAdd reportLines, "  Parameters: not accessible"
+        Exit Sub
+    End If
+
+    Dim i
+    For i = 0 To collections.Count - 1
+        ListAdd reportLines, "  Parameter collection #" & CStr(i + 1)
+        Call AppendParameterCollection(reportLines, collections.Item(i), limit)
+    Next
+End Sub
+
+Sub AddParameterCollections(obj, collections)
+    Call AddCollectionIfAccessible(collections, obj, "Parameters")
+    Call AddReferenceProductCollectionIfAccessible(collections, obj, "Parameters")
+    Call AddParentCollectionIfAccessible(collections, obj, "Parameters", 4)
+
+    Dim partObj
+    Set partObj = PartObjectFrom(obj)
+    If Not partObj Is Nothing Then Call AddCollectionIfAccessible(collections, partObj, "Parameters")
+End Sub
+
+Sub AppendParameterCollection(reportLines, params, limit)
+    If params Is Nothing Then
+        ListAdd reportLines, "    not accessible"
+        Exit Sub
+    End If
+
+    Dim countValue
+    countValue = CollectionCount(params)
+    ListAdd reportLines, "    Count: " & CStr(countValue)
+
+    If countValue = 0 Then Exit Sub
+
+    Dim maxItems
+    maxItems = limit
+    If countValue < maxItems Then maxItems = countValue
+
+    Dim i
+    Dim p
+    For i = 1 To maxItems
+        Set p = CollectionItem(params, i)
+        If Not p Is Nothing Then
+            ListAdd reportLines, "    - " & ObjectName(p) & " [" & ObjectTypeName(p) & "] = " & ParameterDisplayValue(p)
+        End If
+    Next
+
+    If countValue > maxItems Then ListAdd reportLines, "    ... truncated after " & CStr(maxItems) & " items"
+End Sub
+
+Sub AppendRelationsFromObjectAndRelatives(reportLines, obj, limit)
+    Dim added
+    added = 0
+
+    added = added + AppendCollectionByPropertyWithReturn(reportLines, obj, "Relations", limit)
+    added = added + AppendReferenceProductCollectionByPropertyWithReturn(reportLines, obj, "Relations", limit)
+
+    Dim partObj
+    Set partObj = PartObjectFrom(obj)
+    If Not partObj Is Nothing Then added = added + AppendCollectionByPropertyWithReturn(reportLines, partObj, "Relations", limit)
+
+    If added = 0 Then ListAdd reportLines, "  Relations: not accessible"
+End Sub
+
+Sub AppendPublicationsFromObjectAndRelatives(reportLines, obj, limit)
+    Dim added
+    added = 0
+
+    added = added + AppendCollectionByPropertyWithReturn(reportLines, obj, "Publications", limit)
+    added = added + AppendReferenceProductCollectionByPropertyWithReturn(reportLines, obj, "Publications", limit)
+
+    Dim partObj
+    Set partObj = PartObjectFrom(obj)
+    If Not partObj Is Nothing Then added = added + AppendCollectionByPropertyWithReturn(reportLines, partObj, "Publications", limit)
+
+    If added = 0 Then ListAdd reportLines, "  Publications: not accessible"
+End Sub
+
+Sub AppendPartGeometryFromObject(reportLines, obj)
+    Dim partObj
+    Set partObj = PartObjectFrom(obj)
+
+    If partObj Is Nothing Then
+        ListAdd reportLines, "  Part object: not accessible"
+        Exit Sub
+    End If
+
+    ListAdd reportLines, "  Part object: " & DescribeModelObject(partObj)
+    Call AppendCollectionByProperty(reportLines, partObj, "Bodies", 300)
+    Call AppendCollectionByProperty(reportLines, partObj, "HybridBodies", 300)
+    Call AppendCollectionByProperty(reportLines, partObj, "OrderedGeometricalSets", 300)
+    Call AppendCollectionByProperty(reportLines, partObj, "GeometricElements", 300)
+End Sub
+
+Sub AppendCollectionByProperty(reportLines, obj, propertyName, limit)
+    Dim dummy
+    dummy = AppendCollectionByPropertyWithReturn(reportLines, obj, propertyName, limit)
+End Sub
+
+Function AppendCollectionByPropertyWithReturn(reportLines, obj, propertyName, limit)
+    AppendCollectionByPropertyWithReturn = 0
+
+    Dim ok
+    Dim errText
+    Dim collectionObj
+    Set collectionObj = ObjectProperty(obj, CStr(propertyName), ok, errText)
+
+    If Not ok Or collectionObj Is Nothing Then
+        ListAdd reportLines, "  " & propertyName & ": not accessible"
+        Exit Function
+    End If
+
+    ListAdd reportLines, "  " & propertyName & ":"
+    Call AppendGenericCollection(reportLines, collectionObj, limit)
+    AppendCollectionByPropertyWithReturn = 1
+End Function
+
+Sub AppendReferenceProductCollectionByProperty(reportLines, obj, propertyName, limit)
+    Dim dummy
+    dummy = AppendReferenceProductCollectionByPropertyWithReturn(reportLines, obj, propertyName, limit)
+End Sub
+
+Function AppendReferenceProductCollectionByPropertyWithReturn(reportLines, obj, propertyName, limit)
+    AppendReferenceProductCollectionByPropertyWithReturn = 0
+
+    Dim refObj
+    Dim ok
+    Dim errText
+    Set refObj = ObjectProperty(obj, "ReferenceProduct", ok, errText)
+
+    If Not ok Or refObj Is Nothing Then Exit Function
+
+    ListAdd reportLines, "  ReferenceProduct." & propertyName & ":"
+    AppendReferenceProductCollectionByPropertyWithReturn = AppendCollectionByPropertyWithReturn(reportLines, refObj, propertyName, limit)
+End Function
+
+Sub AppendGenericCollection(reportLines, collectionObj, limit)
+    Dim countValue
+    countValue = CollectionCount(collectionObj)
+    ListAdd reportLines, "    Count: " & CStr(countValue)
+
+    If countValue = 0 Then Exit Sub
+
+    Dim maxItems
+    maxItems = limit
+    If countValue < maxItems Then maxItems = countValue
+
+    Dim i
+    Dim itemObj
+    For i = 1 To maxItems
+        Set itemObj = CollectionItem(collectionObj, i)
+        If Not itemObj Is Nothing Then
+            ListAdd reportLines, "    - " & DescribeModelObject(itemObj) & " | Value: " & GenericDisplayValue(itemObj)
+        Else
+            ListAdd reportLines, "    - item " & CStr(i) & ": not accessible"
+        End If
+    Next
+
+    If countValue > maxItems Then ListAdd reportLines, "    ... truncated after " & CStr(maxItems) & " items"
+End Sub
+
+Sub AppendProbeAny(reportLines, obj, propertyName)
+    ListAdd reportLines, "  " & CStr(propertyName) & ": " & ProbeAnyProperty(obj, CStr(propertyName))
+End Sub
+
+' ---------------------------------------------------------------------------
+' Property probes
+' ---------------------------------------------------------------------------
+
+Function ProbeAnyProperty(obj, propertyName)
+    Dim ok
+    Dim errText
+    Dim refObj
+
+    Set refObj = ObjectProperty(obj, propertyName, ok, errText)
+    If ok And Not refObj Is Nothing Then
+        ProbeAnyProperty = DescribeModelObject(refObj)
+        Exit Function
+    End If
+
+    Dim scalarValue
+    scalarValue = ScalarProperty(obj, propertyName, ok, errText)
+    If ok Then
+        If scalarValue = "" Then
+            ProbeAnyProperty = "<empty>"
+        Else
+            ProbeAnyProperty = scalarValue
+        End If
+    Else
+        ProbeAnyProperty = "not accessible"
+    End If
+End Function
+
+Function ProbeScalarValue(obj, propertyName)
+    Dim ok
+    Dim errText
+    ProbeScalarValue = ScalarProperty(obj, propertyName, ok, errText)
+    If Not ok Then ProbeScalarValue = ""
+End Function
+
+Function ScalarProperty(obj, propertyName, ByRef ok, ByRef errText)
+    ok = False
+    errText = ""
+    ScalarProperty = ""
+
+    On Error Resume Next
+    Dim v
+    v = Eval("obj." & CStr(propertyName))
+    If Err.Number = 0 Then
+        ok = True
+        ScalarProperty = ScalarToString(v)
+    Else
+        errText = Err.Description
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+Function ObjectProperty(obj, propertyName, ByRef ok, ByRef errText)
+    ok = False
+    errText = ""
+
+    Dim tmpObj
+    Set tmpObj = Nothing
+
+    On Error Resume Next
+    Execute "Set tmpObj = obj." & CStr(propertyName)
+    If Err.Number = 0 Then
+        If Not tmpObj Is Nothing Then ok = True
+    Else
+        errText = Err.Description
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    Set ObjectProperty = tmpObj
+End Function
+
+Function ObjectParent(obj)
+    Dim ok
+    Dim errText
+    Set ObjectParent = ObjectProperty(obj, "Parent", ok, errText)
+End Function
+
+Function ObjectName(obj)
+    ObjectName = ""
+    If obj Is Nothing Then Exit Function
+
+    On Error Resume Next
+    ObjectName = CStr(obj.Name)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ObjectName = CStr(obj.PartNumber)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ObjectName = "<unnamed>"
+    End If
+    On Error GoTo 0
+End Function
+
+Function ObjectTypeName(obj)
+    ObjectTypeName = ""
+    If obj Is Nothing Then
+        ObjectTypeName = "<nothing>"
+    Else
+        On Error Resume Next
+        ObjectTypeName = TypeName(obj)
+        If Err.Number <> 0 Then
+            Err.Clear
+            ObjectTypeName = "<unknown>"
+        End If
+        On Error GoTo 0
+    End If
+End Function
+
+Function DescribeModelObject(obj)
+    If obj Is Nothing Then
+        DescribeModelObject = "<nothing>"
+        Exit Function
+    End If
+
+    Dim nameValue
+    Dim typeValue
+    Dim partNumber
+
+    nameValue = ObjectName(obj)
+    typeValue = ObjectTypeName(obj)
+    partNumber = ProbeScalarValue(obj, "PartNumber")
+
+    If partNumber = "" Then
+        Dim ok
+        Dim errText
+        Dim refObj
+        Set refObj = ObjectProperty(obj, "ReferenceProduct", ok, errText)
+        If ok And Not refObj Is Nothing Then partNumber = ProbeScalarValue(refObj, "PartNumber")
+    End If
+
+    If partNumber <> "" Then
+        DescribeModelObject = partNumber & " (" & typeValue & ": " & nameValue & ")"
+    Else
+        DescribeModelObject = typeValue & ": " & nameValue
+    End If
+End Function
+
+Function ParentPath(obj, maxDepth)
+    ParentPath = ""
+    If obj Is Nothing Then Exit Function
+
+    Dim current
+    Dim depth
+    Dim piece
+    Set current = obj
+    depth = 0
+
+    On Error Resume Next
+    Do While Not current Is Nothing And depth < maxDepth
+        piece = ObjectTypeName(current) & ":" & ObjectName(current)
+        If ParentPath = "" Then
+            ParentPath = piece
+        Else
+            ParentPath = piece & " > " & ParentPath
+        End If
+        Set current = current.Parent
+        If Err.Number <> 0 Then
+            Err.Clear
+            Exit Do
+        End If
+        depth = depth + 1
+    Loop
+    On Error GoTo 0
+End Function
+
+Function FindDocumentFullPath(obj)
+    FindDocumentFullPath = ""
+
+    Dim current
+    Dim depth
+    Set current = obj
+    depth = 0
+
+    On Error Resume Next
+    Do While Not current Is Nothing And depth < 15
+        If TypeName(current) = "ProductDocument" Or TypeName(current) = "PartDocument" Then
+            FindDocumentFullPath = CStr(current.FullName)
+            If Err.Number = 0 And FindDocumentFullPath <> "" Then
+                On Error GoTo 0
+                Exit Function
+            End If
+            Err.Clear
+        End If
+        Set current = current.Parent
+        If Err.Number <> 0 Then
+            Err.Clear
+            Exit Do
+        End If
+        depth = depth + 1
+    Loop
+    On Error GoTo 0
+
+    Dim refObj
+    Dim ok
+    Dim errText
+    Set refObj = ObjectProperty(obj, "ReferenceProduct", ok, errText)
+    If ok And Not refObj Is Nothing Then
+        On Error Resume Next
+        FindDocumentFullPath = CStr(refObj.Parent.FullName)
+        If Err.Number <> 0 Then
+            Err.Clear
+            FindDocumentFullPath = ""
+        End If
+        On Error GoTo 0
+    End If
+
+    If FindDocumentFullPath = "" Then FindDocumentFullPath = "not accessible"
+End Function
+
+Function PartObjectFrom(obj)
+    Dim current
+    Dim depth
+    Dim ok
+    Dim errText
+    Dim partObj
+    Dim refObj
+    Dim parentDoc
+
+    Set PartObjectFrom = Nothing
+    Set current = obj
+    depth = 0
+
+    Do While Not current Is Nothing And depth < 10
+        Set partObj = ObjectProperty(current, "Part", ok, errText)
+        If ok And Not partObj Is Nothing Then
+            Set PartObjectFrom = partObj
+            Exit Function
+        End If
+
+        Set refObj = ObjectProperty(current, "ReferenceProduct", ok, errText)
+        If ok And Not refObj Is Nothing Then
+            Set parentDoc = ObjectParent(refObj)
+            If Not parentDoc Is Nothing Then
+                Set partObj = ObjectProperty(parentDoc, "Part", ok, errText)
+                If ok And Not partObj Is Nothing Then
+                    Set PartObjectFrom = partObj
+                    Exit Function
+                End If
+            End If
+        End If
+
+        Set current = ObjectParent(current)
+        depth = depth + 1
+    Loop
+End Function
+
+' ---------------------------------------------------------------------------
+' Measurement attempts
+' ---------------------------------------------------------------------------
+
+Function TryMeasureLength(doc, obj)
+    TryMeasureLength = ""
+
+    Dim spa
+    Dim measurable
+    Dim partObj
+    Dim refObj
+
+    On Error Resume Next
+    Set spa = doc.GetWorkbench("SPAWorkbench")
+    If Err.Number <> 0 Or spa Is Nothing Then
+        TryMeasureLength = "not accessible: SPAWorkbench unavailable"
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Set measurable = spa.GetMeasurable(obj)
+    If Err.Number = 0 And Not measurable Is Nothing Then
+        TryMeasureLength = ScalarToString(measurable.Length)
+        If TryMeasureLength <> "" Then
+            On Error GoTo 0
+            Exit Function
+        End If
+    End If
+    Err.Clear
+
+    Set partObj = PartObjectFrom(obj)
+    If Not partObj Is Nothing Then
+        Set refObj = partObj.CreateReferenceFromObject(obj)
+        If Err.Number = 0 And Not refObj Is Nothing Then
+            Set measurable = spa.GetMeasurable(refObj)
+            If Err.Number = 0 And Not measurable Is Nothing Then
+                TryMeasureLength = ScalarToString(measurable.Length)
+                If TryMeasureLength <> "" Then
+                    On Error GoTo 0
+                    Exit Function
+                End If
+            End If
+        End If
+    End If
+    Err.Clear
+    On Error GoTo 0
+
+    If TryMeasureLength = "" Then TryMeasureLength = "not accessible: object is not measurable as curve/edge"
+End Function
+
+Function TryBoundingBoxOrCentroid(doc, obj)
+    TryBoundingBoxOrCentroid = ""
+
+    Dim spa
+    Dim measurable
+    Dim coords(2)
+    Dim partObj
+    Dim refObj
+
+    On Error Resume Next
+    Set spa = doc.GetWorkbench("SPAWorkbench")
+    If Err.Number <> 0 Or spa Is Nothing Then
+        TryBoundingBoxOrCentroid = "not accessible: SPAWorkbench unavailable"
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Set measurable = spa.GetMeasurable(obj)
+    If Err.Number = 0 And Not measurable Is Nothing Then
+        measurable.GetCOG coords
+        If Err.Number = 0 Then
+            TryBoundingBoxOrCentroid = "COG: X=" & FormatNumberInvariant(coords(0), 3) & _
+                                      " Y=" & FormatNumberInvariant(coords(1), 3) & _
+                                      " Z=" & FormatNumberInvariant(coords(2), 3)
+            On Error GoTo 0
+            Exit Function
+        End If
+    End If
+    Err.Clear
+
+    Set partObj = PartObjectFrom(obj)
+    If Not partObj Is Nothing Then
+        Set refObj = partObj.CreateReferenceFromObject(obj)
+        If Err.Number = 0 And Not refObj Is Nothing Then
+            Set measurable = spa.GetMeasurable(refObj)
+            If Err.Number = 0 And Not measurable Is Nothing Then
+                measurable.GetCOG coords
+                If Err.Number = 0 Then
+                    TryBoundingBoxOrCentroid = "COG: X=" & FormatNumberInvariant(coords(0), 3) & _
+                                              " Y=" & FormatNumberInvariant(coords(1), 3) & _
+                                              " Z=" & FormatNumberInvariant(coords(2), 3)
+                    On Error GoTo 0
+                    Exit Function
+                End If
+            End If
+        End If
+    End If
+    Err.Clear
+    On Error GoTo 0
+
+    If TryBoundingBoxOrCentroid = "" Then TryBoundingBoxOrCentroid = "not accessible: no COG/bounding box through SPAWorkbench"
+End Function
+
+' ---------------------------------------------------------------------------
+' Links and counters
+' ---------------------------------------------------------------------------
+
+Function FindObjectByTrailingIndex(dict, indexValue)
+    Set FindObjectByTrailingIndex = Nothing
+    If indexValue = "" Then Exit Function
+
+    Dim key
+    Dim obj
+    For Each key In dict.Keys
+        Set obj = dict.Item(key)
+        If ExtractTrailingIndex(ObjectName(obj)) = indexValue Then
+            Set FindObjectByTrailingIndex = obj
+            Exit Function
+        End If
+    Next
+End Function
+
+Function LinkName(obj)
+    If obj Is Nothing Then
+        LinkName = "?"
+    Else
+        LinkName = ObjectName(obj)
+    End If
+End Function
+
+Function CountSymbolsLinkedToAssemblyJoints(symbols, specs, materials)
+    CountSymbolsLinkedToAssemblyJoints = 0
+
+    Dim key
+    Dim obj
+    Dim idx
+    Dim specObj
+    Dim materialObj
+
+    For Each key In symbols.Keys
+        Set obj = symbols.Item(key)
+        idx = ExtractTrailingIndex(ObjectName(obj))
+        Set specObj = FindObjectByTrailingIndex(specs, idx)
+        Set materialObj = FindObjectByTrailingIndex(materials, idx)
+        If Not specObj Is Nothing Or Not materialObj Is Nothing Then CountSymbolsLinkedToAssemblyJoints = CountSymbolsLinkedToAssemblyJoints + 1
+    Next
+End Function
+
+Function CountAssemblyJointsWithPartAB(specs, materials)
+    CountAssemblyJointsWithPartAB = 0
+    CountAssemblyJointsWithPartAB = CountAssemblyJointsWithPartAB + CountDictWithPartAB(specs)
+    CountAssemblyJointsWithPartAB = CountAssemblyJointsWithPartAB + CountDictWithPartAB(materials)
+End Function
+
+Function CountDictWithPartAB(dict)
+    CountDictWithPartAB = 0
+
+    Dim key
+    Dim obj
+    For Each key In dict.Keys
+        Set obj = dict.Item(key)
+        If CandidatePartA(obj) <> "" Or CandidatePartB(obj) <> "" Then CountDictWithPartAB = CountDictWithPartAB + 1
+    Next
+End Function
+
+Function CountAssemblyJointsWithValue(specs, materials, valueKind)
+    CountAssemblyJointsWithValue = 0
+    CountAssemblyJointsWithValue = CountAssemblyJointsWithValue + CountDictWithValue(specs, valueKind)
+    CountAssemblyJointsWithValue = CountAssemblyJointsWithValue + CountDictWithValue(materials, valueKind)
+End Function
+
+Function CountDictWithValue(dict, valueKind)
+    CountDictWithValue = 0
+
+    Dim key
+    Dim obj
+    Dim value
+
+    For Each key In dict.Keys
+        Set obj = dict.Item(key)
+        If UCase(valueKind) = "SIZE" Then
+            value = CandidateWeldSize(obj)
+        ElseIf UCase(valueKind) = "LENGTH" Then
+            value = CandidateWeldLength(obj)
+        Else
+            value = ""
+        End If
+        If value <> "" Then CountDictWithValue = CountDictWithValue + 1
+    Next
+End Function
+
+Function ExtractTrailingIndex(textValue)
+    ExtractTrailingIndex = ""
+
+    Dim s
+    Dim parts
+    Dim lastPart
+    s = CStr(textValue)
+
+    parts = Split(s, ".")
+    If UBound(parts) < 1 Then Exit Function
+
+    lastPart = CStr(parts(UBound(parts)))
+    lastPart = Trim(Replace(lastPart, " Shape", ""))
+    lastPart = Trim(Replace(lastPart, "Shape", ""))
+
+    If IsNumeric(lastPart) Then ExtractTrailingIndex = CStr(CLng(lastPart))
+End Function
+
+' ---------------------------------------------------------------------------
+' Generic helpers
+' ---------------------------------------------------------------------------
+
+Sub AddCollectionIfAccessible(collections, obj, propertyName)
+    Dim ok
+    Dim errText
+    Dim collectionObj
+    Set collectionObj = ObjectProperty(obj, propertyName, ok, errText)
+    If ok And Not collectionObj Is Nothing Then collections.Add collectionObj
+End Sub
+
+Sub AddReferenceProductCollectionIfAccessible(collections, obj, propertyName)
+    Dim ok
+    Dim errText
+    Dim refObj
+    Set refObj = ObjectProperty(obj, "ReferenceProduct", ok, errText)
+    If ok And Not refObj Is Nothing Then Call AddCollectionIfAccessible(collections, refObj, propertyName)
+End Sub
+
+Sub AddParentCollectionIfAccessible(collections, obj, propertyName, maxDepth)
+    Dim current
+    Dim depth
+    Set current = ObjectParent(obj)
+    depth = 0
+
+    Do While Not current Is Nothing And depth < maxDepth
+        Call AddCollectionIfAccessible(collections, current, propertyName)
+        Set current = ObjectParent(current)
+        depth = depth + 1
+    Loop
+End Sub
+
+Function CollectionCount(collectionObj)
+    CollectionCount = 0
+    If collectionObj Is Nothing Then Exit Function
+
+    On Error Resume Next
+    CollectionCount = CLng(collectionObj.Count)
+    If Err.Number <> 0 Then
+        Err.Clear
+        CollectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function CollectionItem(collectionObj, indexValue)
+    Set CollectionItem = Nothing
+    If collectionObj Is Nothing Then Exit Function
+
+    On Error Resume Next
+    Set CollectionItem = collectionObj.Item(CLng(indexValue))
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set CollectionItem = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+Function SelectionCount(sel)
+    SelectionCount = 0
+
+    On Error Resume Next
+    SelectionCount = CLng(sel.Count2)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = CLng(sel.Count)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SelectionItemValue(sel, indexValue)
+    Set SelectionItemValue = Nothing
+
+    On Error Resume Next
+    Set SelectionItemValue = sel.Item2(CLng(indexValue)).Value
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set SelectionItemValue = sel.Item(CLng(indexValue)).Value
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set SelectionItemValue = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+Function ParameterDisplayValue(parameterObj)
+    ParameterDisplayValue = GenericDisplayValue(parameterObj)
+End Function
+
+Function GenericDisplayValue(obj)
+    GenericDisplayValue = FirstNonEmpty(Array( _
+        ProbeScalarValue(obj, "ValueAsString"), _
+        ProbeScalarValue(obj, "Value"), _
+        ProbeScalarValue(obj, "Magnitude"), _
+        ProbeScalarValue(obj, "Formula"), _
+        ProbeScalarValue(obj, "Comment"), _
+        ProbeScalarValue(obj, "Definition"), _
+        ProbeScalarValue(obj, "DescriptionRef")))
+End Function
+
+Function ScalarToString(value)
+    On Error Resume Next
+    If IsNull(value) Then
+        ScalarToString = ""
+    ElseIf IsEmpty(value) Then
+        ScalarToString = ""
+    ElseIf VarType(value) = 11 Then
+        If CBool(value) Then
+            ScalarToString = "True"
+        Else
+            ScalarToString = "False"
+        End If
+    Else
+        ScalarToString = CStr(value)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ScalarToString = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function EmptyAsNotAccessible(value)
+    If Trim(CStr(value)) = "" Then
+        EmptyAsNotAccessible = "not accessible"
+    Else
+        EmptyAsNotAccessible = CStr(value)
+    End If
+End Function
+
+Function FirstNonEmpty(values)
+    FirstNonEmpty = ""
+
+    Dim i
+    Dim v
+    For i = LBound(values) To UBound(values)
+        v = Trim(CStr(values(i)))
+        If v <> "" Then
+            FirstNonEmpty = v
+            Exit Function
+        End If
+    Next
+End Function
+
+Function NormalizeName(value)
+    Dim s
+    s = UCase(CStr(value))
+    s = Replace(s, " ", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "\", "")
+    NormalizeName = s
+End Function
+
+Function FormatNumberInvariant(value, decimals)
+    FormatNumberInvariant = Replace(CStr(Round(CDbl(value), CInt(decimals))), ",", ".")
+End Function
+
+Function SafeDocumentName(doc)
+    SafeDocumentName = ObjectName(doc)
+
+    On Error Resume Next
+    If SafeDocumentName = "" Then SafeDocumentName = CStr(doc.FullName)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeDocumentName = "<active document>"
+    End If
+    On Error GoTo 0
+End Function
+
+Function WriteReportFile(doc, reportLines)
+    Dim folderPath
+    folderPath = ReportFolder(doc)
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim reportPath
+    reportPath = fso.BuildPath(folderPath, REPORT_FILE_NAME)
+
+    Dim stream
+    Set stream = fso.CreateTextFile(reportPath, True, False)
+
+    Dim i
+    For i = 0 To reportLines.Count - 1
+        stream.WriteLine CStr(reportLines.Item(i))
+    Next
+
+    stream.Close
+    WriteReportFile = reportPath
+End Function
+
+Function ReportFolder(doc)
+    ReportFolder = ""
+
+    On Error Resume Next
+    ReportFolder = CStr(doc.Path)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ReportFolder = ""
+    End If
+    On Error GoTo 0
+
+    If ReportFolder = "" Then ReportFolder = DesktopFolder()
+End Function
+
+Function DesktopFolder()
+    On Error Resume Next
+    DesktopFolder = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+    If Err.Number <> 0 Or DesktopFolder = "" Then
+        Err.Clear
+        DesktopFolder = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
+    End If
+    On Error GoTo 0
+End Function
+
