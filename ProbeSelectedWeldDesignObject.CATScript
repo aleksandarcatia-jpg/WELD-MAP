@@ -1373,7 +1373,7 @@ Function NewList()
 End Function
 
 Sub ListAdd(listObj, textValue)
-    listObj.Add CStr(textValue)
+    listObj.Add SafeText(textValue)
 End Sub
 
 Function WriteReportFile(doc, reportLines)
@@ -1387,15 +1387,139 @@ Function WriteReportFile(doc, reportLines)
     reportPath = fso.BuildPath(folderPath, REPORT_FILE_NAME)
 
     Dim stream
+    Set stream = Nothing
+
+    On Error Resume Next
     Set stream = fso.CreateTextFile(reportPath, True, False)
+    If Err.Number <> 0 Or stream Is Nothing Then
+        Dim createErr
+        createErr = Err.Description
+        Err.Clear
+        On Error GoTo 0
+        WriteReportFile = WriteMinimalReportFile(doc, reportLines, "CreateTextFile", createErr)
+        Exit Function
+    End If
 
     Dim i
     For i = 0 To reportLines.Count - 1
-        stream.WriteLine CStr(reportLines.Item(i))
+        On Error Resume Next
+        stream.WriteLine SafeText(reportLines.Item(i))
+        If Err.Number <> 0 Then
+            Err.Clear
+            stream.WriteLine "<not writable> <WriteLine failed at report line " & CStr(i) & ">"
+            If Err.Number <> 0 Then Err.Clear
+        End If
+        On Error GoTo 0
     Next
 
+    On Error Resume Next
     stream.Close
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
     WriteReportFile = reportPath
+End Function
+
+Function WriteMinimalReportFile(doc, reportLines, errorLocation, errorDescription)
+    Dim folderPath
+    folderPath = ReportFolder(doc)
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim reportPath
+    reportPath = fso.BuildPath(folderPath, "selected_weld_design_object_probe_MINIMAL.txt")
+
+    Dim stream
+    Set stream = Nothing
+
+    On Error Resume Next
+    Set stream = fso.CreateTextFile(reportPath, True, False)
+    If Err.Number <> 0 Or stream Is Nothing Then
+        Err.Clear
+        reportPath = fso.BuildPath(DesktopFolder(), "selected_weld_design_object_probe_MINIMAL.txt")
+        Set stream = fso.CreateTextFile(reportPath, True, False)
+    End If
+
+    If Err.Number <> 0 Or stream Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        WriteMinimalReportFile = reportPath
+        Exit Function
+    End If
+
+    stream.WriteLine "Selected object name: " & SafeText(ReportLineValue(reportLines, "Selected object name:"))
+    If Err.Number <> 0 Then Err.Clear
+    stream.WriteLine "TypeName: " & SafeText(ReportLineValue(reportLines, "TypeName:"))
+    If Err.Number <> 0 Then Err.Clear
+    stream.WriteLine "Parent path: " & SafeText(ReportLineValue(reportLines, "Parent path:"))
+    If Err.Number <> 0 Then Err.Clear
+    stream.WriteLine "Error location: " & SafeText(errorLocation)
+    If Err.Number <> 0 Then Err.Clear
+    stream.WriteLine "Error description: " & SafeText(errorDescription)
+    If Err.Number <> 0 Then Err.Clear
+    stream.Close
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
+    WriteMinimalReportFile = reportPath
+End Function
+
+Function ReportLineValue(reportLines, prefix)
+    ReportLineValue = "not available"
+
+    If reportLines Is Nothing Then Exit Function
+
+    Dim i
+    Dim lineText
+    Dim p
+    p = CStr(prefix)
+
+    On Error Resume Next
+    For i = 0 To reportLines.Count - 1
+        lineText = SafeText(reportLines.Item(i))
+        If Left(lineText, Len(p)) = p Then
+            ReportLineValue = Trim(Mid(lineText, Len(p) + 1))
+            If ReportLineValue = "" Then ReportLineValue = "not available"
+            Exit Function
+        End If
+        If Err.Number <> 0 Then Err.Clear
+    Next
+    On Error GoTo 0
+End Function
+
+Function SafeText(value)
+    On Error Resume Next
+
+    If IsNull(value) Then
+        SafeText = "<Null>"
+        Exit Function
+    End If
+
+    If IsEmpty(value) Then
+        SafeText = "<Empty>"
+        Exit Function
+    End If
+
+    Dim s
+    s = CStr(value)
+
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeText = "<CStr failed>"
+        Exit Function
+    End If
+
+    s = Replace(s, Chr(0), "")
+    s = Replace(s, vbCrLf, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+
+    If Len(s) > 2000 Then
+        s = Left(s, 2000) & " ... <truncated>"
+    End If
+
+    SafeText = s
 End Function
 
 Function ReportFolder(doc)
@@ -1421,4 +1545,3 @@ Function DesktopFolder()
     End If
     On Error GoTo 0
 End Function
-
