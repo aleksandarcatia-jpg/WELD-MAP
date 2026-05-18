@@ -1,0 +1,492 @@
+Option Explicit
+
+' ---------------------------------------------------------------------------
+' GenerateWeldLabelsFromRegister.CATScript
+'
+' Drawing macro for Weld Design workflow.
+' Reads weld_design_register.csv and tries to update existing Weld Design
+' drawing annotations / Weld Symbol.N objects with W001/W002 labels.
+'
+' It never places random arrows. If a Weld Symbol or position is not accessible,
+' the weld is reported as unplaced and processing continues.
+' ---------------------------------------------------------------------------
+
+Const MACRO_NAME = "GenerateWeldLabelsFromRegister"
+Const REGISTER_FILE_NAME = "weld_design_register.csv"
+Const REPORT_FILE_NAME = "weld_labels_from_register_report.txt"
+
+Sub CATMain()
+    Dim doc
+    Set doc = Nothing
+
+    On Error Resume Next
+    Set doc = CATIA.ActiveDocument
+    On Error GoTo 0
+
+    If doc Is Nothing Then
+        MsgBox "Open CATDrawing and run this macro again.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    If TypeName(doc) <> "DrawingDocument" Then
+        MsgBox "Active document must be CATDrawing.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim registerPath
+    registerPath = ResolveRegisterPath(doc)
+    If registerPath = "" Then Exit Sub
+
+    Dim rows
+    Set rows = LoadRegisterCsv(registerPath)
+    If rows.Count = 0 Then
+        MsgBox "No rows found in weld_design_register.csv.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim report
+    Set report = NewList()
+    ListAdd report, "Weld labels from register"
+    ListAdd report, "Register: " & registerPath
+    ListAdd report, ""
+
+    Dim placed
+    Dim nativeUpdated
+    Dim textFallback
+    Dim unplaced
+    placed = 0
+    nativeUpdated = 0
+    textFallback = 0
+    unplaced = 0
+
+    Dim i
+    Dim rec
+    For i = 0 To rows.Count - 1
+        Set rec = rows.Item(i)
+        If PlaceLabelForRecord(doc, rec, report, nativeUpdated, textFallback) Then
+            placed = placed + 1
+        Else
+            unplaced = unplaced + 1
+        End If
+    Next
+
+    Dim reportPath
+    reportPath = ReportPath(doc, REPORT_FILE_NAME)
+    Call WriteTextFile(reportPath, report)
+
+    MsgBox "Weld labels from register completed." & vbCrLf & _
+           "Weld labels placed: " & CStr(placed) & vbCrLf & _
+           "Weld labels updated in native symbol: " & CStr(nativeUpdated) & vbCrLf & _
+           "Weld labels placed as text fallback: " & CStr(textFallback) & vbCrLf & _
+           "Unplaced weld labels: " & CStr(unplaced) & vbCrLf & _
+           "Report: " & reportPath, vbInformation, MACRO_NAME
+End Sub
+
+Function PlaceLabelForRecord(doc, rec, report, ByRef nativeUpdated, ByRef textFallback)
+    PlaceLabelForRecord = False
+
+    Dim weldID
+    Dim symbolName
+    Dim jointIndex
+    weldID = DictValue(rec, "WeldID")
+    symbolName = DictValue(rec, "WeldSymbolName")
+    jointIndex = DictValue(rec, "AssemblyJointIndex")
+
+    If weldID = "" Then weldID = "W" & Right("000" & CStr(CLngOrZero(jointIndex)), 3)
+    If symbolName = "" And jointIndex <> "" Then symbolName = "Weld Symbol." & CStr(CLngOrZero(jointIndex))
+
+    If weldID = "" Or symbolName = "" Then
+        ListAdd report, weldID & " label not placed: missing WeldID or WeldSymbolName"
+        Exit Function
+    End If
+
+    Dim symbolObj
+    Set symbolObj = FindObjectByName(doc, symbolName)
+    If symbolObj Is Nothing Then
+        ListAdd report, weldID & " label not placed: " & symbolName & " not found in drawing"
+        Exit Function
+    End If
+
+    If TryUpdateNativeSymbol(symbolObj, weldID) Then
+        nativeUpdated = nativeUpdated + 1
+        ListAdd report, weldID & " updated in native symbol: " & symbolName
+        PlaceLabelForRecord = True
+        Exit Function
+    End If
+
+    If TryPlaceTextNearSymbol(symbolObj, weldID) Then
+        textFallback = textFallback + 1
+        ListAdd report, weldID & " placed as text fallback near: " & symbolName
+        PlaceLabelForRecord = True
+        Exit Function
+    End If
+
+    ListAdd report, weldID & " label not placed: symbol found but text/position is not accessible"
+End Function
+
+Function FindObjectByName(doc, objectName)
+    Set FindObjectByName = Nothing
+
+    Dim sel
+    Set sel = doc.Selection
+
+    On Error Resume Next
+    sel.Clear
+    Err.Clear
+    sel.Search "Name=" & CStr(objectName) & ",all"
+    If Err.Number <> 0 Or SelectionCount(sel) = 0 Then
+        Err.Clear
+        sel.Clear
+        sel.Search "Name=*" & CStr(objectName) & "*,all"
+    End If
+    If Err.Number = 0 And SelectionCount(sel) > 0 Then
+        Set FindObjectByName = SelectionItemValue(sel, 1)
+    End If
+    Err.Clear
+    sel.Clear
+    On Error GoTo 0
+End Function
+
+Function TryUpdateNativeSymbol(symbolObj, weldID)
+    TryUpdateNativeSymbol = False
+
+    Dim props
+    props = Array("PrimarySize", "PrimaryWeldSize", "Size", "Text", "TextString", "Value", "String")
+
+    Dim i
+    For i = LBound(props) To UBound(props)
+        If TrySetScalarProperty(symbolObj, CStr(props(i)), weldID) Then
+            TryUpdateNativeSymbol = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Function TrySetScalarProperty(obj, propertyName, value)
+    TrySetScalarProperty = False
+    If obj Is Nothing Then Exit Function
+    If Not IsAutomationIdentifier(propertyName) Then Exit Function
+
+    Dim labelValue
+    labelValue = CStr(value)
+
+    On Error Resume Next
+    Execute "obj." & CStr(propertyName) & " = labelValue"
+    If Err.Number = 0 Then TrySetScalarProperty = True
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Function TryPlaceTextNearSymbol(symbolObj, weldID)
+    TryPlaceTextNearSymbol = False
+
+    Dim view
+    Set view = ViewWithTexts(symbolObj)
+    If view Is Nothing Then Exit Function
+
+    Dim x
+    Dim y
+    x = ProbeDouble(symbolObj, "X")
+    y = ProbeDouble(symbolObj, "Y")
+    If x = "" Or y = "" Then Exit Function
+
+    Dim txt
+    Set txt = Nothing
+    On Error Resume Next
+    Set txt = view.Texts.Add(CStr(weldID), CDbl(x) + 5.0, CDbl(y) + 5.0)
+    If Err.Number = 0 And Not txt Is Nothing Then
+        txt.Name = "LABEL_" & CStr(weldID)
+        txt.SetFontSize 0, 0, 3.5
+        TryPlaceTextNearSymbol = True
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Function ViewWithTexts(obj)
+    Set ViewWithTexts = Nothing
+
+    Dim current
+    Set current = obj
+
+    Dim depth
+    depth = 0
+    Do While Not current Is Nothing And depth < 12
+        Dim texts
+        Set texts = Nothing
+        On Error Resume Next
+        Set texts = current.Texts
+        If Err.Number = 0 And Not texts Is Nothing Then
+            Set ViewWithTexts = current
+            On Error GoTo 0
+            Exit Function
+        End If
+        Err.Clear
+        Set current = ObjectParent(current)
+        On Error GoTo 0
+        depth = depth + 1
+    Loop
+End Function
+
+' ---------------------------------------------------------------------------
+' CSV / file helpers
+' ---------------------------------------------------------------------------
+
+Function ResolveRegisterPath(doc)
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim path
+    path = ReportPath(doc, REGISTER_FILE_NAME)
+
+    If fso.FileExists(path) Then
+        ResolveRegisterPath = path
+        Exit Function
+    End If
+
+    path = InputBox("weld_design_register.csv was not found next to drawing." & vbCrLf & _
+                    "Enter full path to weld_design_register.csv:", MACRO_NAME, path)
+    If Trim(path) = "" Then
+        ResolveRegisterPath = ""
+        Exit Function
+    End If
+
+    If Not fso.FileExists(path) Then
+        MsgBox "Register file not found:" & vbCrLf & path, vbExclamation, MACRO_NAME
+        ResolveRegisterPath = ""
+    Else
+        ResolveRegisterPath = path
+    End If
+End Function
+
+Function LoadRegisterCsv(filePath)
+    Dim rows
+    Set rows = NewList()
+    Set LoadRegisterCsv = rows
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(filePath) Then Exit Function
+
+    Dim ts
+    Set ts = fso.OpenTextFile(filePath, 1, False)
+    If ts.AtEndOfStream Then
+        ts.Close
+        Exit Function
+    End If
+
+    Dim headers
+    headers = ParseDelimitedLine(ts.ReadLine)
+
+    Do While Not ts.AtEndOfStream
+        Dim line
+        line = ts.ReadLine
+        If Trim(line) <> "" Then rows.Add CsvRowToDictionary(headers, ParseDelimitedLine(line))
+    Loop
+
+    ts.Close
+End Function
+
+Function ParseDelimitedLine(line)
+    Dim delimiter
+    If InStr(line, ";") > 0 Then
+        delimiter = ";"
+    ElseIf InStr(line, "|") > 0 Then
+        delimiter = "|"
+    Else
+        delimiter = ","
+    End If
+    ParseDelimitedLine = Split(line, delimiter)
+End Function
+
+Function CsvRowToDictionary(headers, values)
+    Dim d
+    Set d = NewDictionary()
+
+    Dim i
+    For i = LBound(headers) To UBound(headers)
+        If i <= UBound(values) Then
+            d.Add Trim(Unquote(CStr(headers(i)))), Trim(Unquote(CStr(values(i))))
+        Else
+            d.Add Trim(Unquote(CStr(headers(i)))), ""
+        End If
+    Next
+    Set CsvRowToDictionary = d
+End Function
+
+Function Unquote(value)
+    Dim s
+    s = CStr(value)
+    If Len(s) >= 2 Then
+        If Left(s, 1) = """" And Right(s, 1) = """" Then s = Mid(s, 2, Len(s) - 2)
+    End If
+    Unquote = Replace(s, """""", """")
+End Function
+
+Sub WriteTextFile(filePath, lines)
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim ts
+    Set ts = fso.CreateTextFile(filePath, True, False)
+    Dim i
+    For i = 0 To lines.Count - 1
+        ts.WriteLine SafeText(lines.Item(i))
+    Next
+    ts.Close
+End Sub
+
+' ---------------------------------------------------------------------------
+' Generic helpers
+' ---------------------------------------------------------------------------
+
+Function NewDictionary()
+    Dim d
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+    Set NewDictionary = d
+End Function
+
+Function NewList()
+    Set NewList = CreateObject("System.Collections.ArrayList")
+End Function
+
+Sub ListAdd(listObj, value)
+    listObj.Add SafeText(value)
+End Sub
+
+Function DictValue(d, key)
+    If d Is Nothing Then
+        DictValue = ""
+    ElseIf d.Exists(CStr(key)) Then
+        DictValue = CStr(d.Item(CStr(key)))
+    Else
+        DictValue = ""
+    End If
+End Function
+
+Function SelectionCount(sel)
+    SelectionCount = 0
+    On Error Resume Next
+    SelectionCount = CLng(sel.Count2)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = CLng(sel.Count)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SelectionItemValue(sel, indexValue)
+    Set SelectionItemValue = Nothing
+    On Error Resume Next
+    Set SelectionItemValue = sel.Item2(CLng(indexValue)).Value
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set SelectionItemValue = sel.Item(CLng(indexValue)).Value
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set SelectionItemValue = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+Function ObjectParent(obj)
+    Set ObjectParent = Nothing
+    If obj Is Nothing Then Exit Function
+    On Error Resume Next
+    Set ObjectParent = obj.Parent
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set ObjectParent = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+Function ProbeDouble(obj, propertyName)
+    ProbeDouble = ""
+    If obj Is Nothing Then Exit Function
+    If Not IsAutomationIdentifier(propertyName) Then Exit Function
+    On Error Resume Next
+    Dim v
+    v = Eval("obj." & CStr(propertyName))
+    If Err.Number = 0 Then ProbeDouble = CStr(CDbl(v))
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Function IsAutomationIdentifier(value)
+    Dim s
+    Dim i
+    Dim ch
+    s = CStr(value)
+    If s = "" Then
+        IsAutomationIdentifier = False
+        Exit Function
+    End If
+    ch = Mid(s, 1, 1)
+    If Not ((ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Or ch = "_") Then
+        IsAutomationIdentifier = False
+        Exit Function
+    End If
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        If Not ((ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Or (ch >= "0" And ch <= "9") Or ch = "_") Then
+            IsAutomationIdentifier = False
+            Exit Function
+        End If
+    Next
+    IsAutomationIdentifier = True
+End Function
+
+Function CLngOrZero(value)
+    On Error Resume Next
+    CLngOrZero = CLng(value)
+    If Err.Number <> 0 Then
+        Err.Clear
+        CLngOrZero = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeText(value)
+    On Error Resume Next
+    Dim s
+    If IsNull(value) Then
+        SafeText = "<Null>"
+        Exit Function
+    End If
+    If IsEmpty(value) Then
+        SafeText = ""
+        Exit Function
+    End If
+    s = CStr(value)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeText = "<CStr failed>"
+        Exit Function
+    End If
+    s = Replace(s, Chr(0), "")
+    s = Replace(s, vbCrLf, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    SafeText = s
+End Function
+
+Function ReportPath(doc, fileName)
+    Dim folderPath
+    folderPath = ""
+    On Error Resume Next
+    folderPath = CStr(doc.Path)
+    If Err.Number <> 0 Then
+        Err.Clear
+        folderPath = ""
+    End If
+    On Error GoTo 0
+    If folderPath = "" Then folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+    ReportPath = CreateObject("Scripting.FileSystemObject").BuildPath(folderPath, fileName)
+End Function
+

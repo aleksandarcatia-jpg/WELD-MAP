@@ -1,0 +1,1344 @@
+Option Explicit
+
+' ---------------------------------------------------------------------------
+' BuildWeldRegisterFromWeldDesign.CATScript
+'
+' Main model macro for the Weld Design workflow.
+' Run in an active CATProduct after Weld Design assembly joints are created.
+'
+' Output:
+'   weld_design_register.csv
+'   weld_design_register_report.txt
+'
+' This macro does not require the user to select each weld. It scans Assembly
+' Joint objects, assigns W001/W002/W003 by Assembly Joint index, resolves Part A
+' / Part B from the root product tree when possible, and leaves missing values
+' explicit in the register.
+' ---------------------------------------------------------------------------
+
+Const MACRO_NAME = "BuildWeldRegisterFromWeldDesign"
+Const REGISTER_FILE_NAME = "weld_design_register.csv"
+Const REPORT_FILE_NAME = "weld_design_register_report.txt"
+
+Sub CATMain()
+    Dim doc
+    Set doc = Nothing
+
+    On Error Resume Next
+    Set doc = CATIA.ActiveDocument
+    On Error GoTo 0
+
+    If doc Is Nothing Then
+        MsgBox "Open CATProduct and run this macro again.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    If TypeName(doc) <> "ProductDocument" Then
+        MsgBox "Active document must be CATProduct.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim defaultPosition
+    defaultPosition = UCase(Trim(InputBox("Default welding position for all missing positions:" & vbCrLf & _
+                                          "PA / PB / PC / PD / PE / PF / PG", _
+                                          MACRO_NAME, "PB")))
+    If defaultPosition = "" Then defaultPosition = "PB"
+
+    Dim report
+    Set report = NewList()
+    ListAdd report, "CATIA Weld Design register build"
+    ListAdd report, "Active document: " & SafeDocumentName(doc)
+    ListAdd report, "Default welding position: " & defaultPosition
+    ListAdd report, ""
+
+    Dim productMap
+    Set productMap = NewDictionary()
+    Call BuildProductInstanceMap(doc.Product, productMap)
+
+    Dim jointRecords
+    Set jointRecords = NewDictionary()
+    Call ScanAssemblyJoints(doc, jointRecords, report)
+    Call ScanWeldChildren(doc, jointRecords, report)
+
+    If jointRecords.Count = 0 Then
+        ListAdd report, "No Assembly Joint objects found."
+        Call WriteTextFile(ReportPath(doc, REPORT_FILE_NAME), report)
+        MsgBox "No Assembly Joint objects found." & vbCrLf & _
+               "Use CATIA Weld Design to create weld joints first.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim wpsRows
+    Set wpsRows = LoadWpsLibrary(doc, report)
+
+    Dim sortedIndexes
+    sortedIndexes = SortedNumericKeys(jointRecords)
+
+    Dim csvRows
+    Set csvRows = NewList()
+
+    Dim i
+    Dim idx
+    Dim rec
+    For i = LBound(sortedIndexes) To UBound(sortedIndexes)
+        idx = CStr(sortedIndexes(i))
+        Set rec = jointRecords.Item(idx)
+
+        Call CompleteJointRecord(doc, rec, productMap, defaultPosition, wpsRows)
+        csvRows.Add RecordToCsvValues(rec)
+    Next
+
+    Dim registerPath
+    Dim reportPath
+    registerPath = ReportPath(doc, REGISTER_FILE_NAME)
+    reportPath = ReportPath(doc, REPORT_FILE_NAME)
+
+    Call WriteCsvFile(registerPath, RegisterHeaders(), csvRows)
+    Call AppendRegisterSummary(report, jointRecords)
+    Call WriteTextFile(reportPath, report)
+
+    MsgBox "Weld Design register completed." & vbCrLf & _
+           "Total Assembly Joints found: " & CStr(jointRecords.Count) & vbCrLf & _
+           "CSV: " & registerPath & vbCrLf & _
+           "Report: " & reportPath, vbInformation, MACRO_NAME
+End Sub
+
+' ---------------------------------------------------------------------------
+' Scanning
+' ---------------------------------------------------------------------------
+
+Sub ScanAssemblyJoints(doc, jointRecords, report)
+    Dim queries
+    queries = Array("Name=*Assembly Joint*,all", "Name=*Assembly*Joint*,all", "Name=*Joint*,all")
+
+    Dim q
+    For q = LBound(queries) To UBound(queries)
+        Call ScanAssemblyJointsByQuery(doc, CStr(queries(q)), jointRecords)
+    Next
+
+    ListAdd report, "Assembly Joint candidates collected: " & CStr(jointRecords.Count)
+End Sub
+
+Sub ScanAssemblyJointsByQuery(doc, query, jointRecords)
+    Dim sel
+    Set sel = doc.Selection
+
+    On Error Resume Next
+    sel.Clear
+    Err.Clear
+    sel.Search CStr(query)
+    If Err.Number <> 0 Then
+        Err.Clear
+        sel.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    Dim countValue
+    Dim i
+    Dim obj
+    Dim idx
+    Dim nameValue
+
+    countValue = SelectionCount(sel)
+    For i = 1 To countValue
+        Set obj = SelectionItemValue(sel, i)
+        If Not obj Is Nothing Then
+            nameValue = ObjectName(obj)
+            If IsAssemblyJointName(nameValue) Then
+                idx = ExtractAssemblyJointIndex(nameValue)
+                If idx = "" Then idx = ExtractAssemblyJointIndex(ParentPath(obj, 8))
+                If idx <> "" Then Call AddOrUpdateJointRecord(jointRecords, idx, obj)
+            End If
+        End If
+    Next
+
+    sel.Clear
+    On Error GoTo 0
+End Sub
+
+Sub ScanWeldChildren(doc, jointRecords, report)
+    Dim queries
+    queries = Array("Name=*Joint Body*,all", "Name=*Weld Symbol*,all", "Name=*Weld.*,all", "Name=*New Material*,all", "Name=*Material*,all")
+
+    Dim q
+    For q = LBound(queries) To UBound(queries)
+        Call ScanWeldChildrenByQuery(doc, CStr(queries(q)), jointRecords)
+    Next
+
+    ListAdd report, "Weld child scan completed."
+End Sub
+
+Sub ScanWeldChildrenByQuery(doc, query, jointRecords)
+    Dim sel
+    Set sel = doc.Selection
+
+    On Error Resume Next
+    sel.Clear
+    Err.Clear
+    sel.Search CStr(query)
+    If Err.Number <> 0 Then
+        Err.Clear
+        sel.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    Dim i
+    Dim obj
+    Dim nameValue
+    Dim idx
+    Dim rec
+
+    For i = 1 To SelectionCount(sel)
+        Set obj = SelectionItemValue(sel, i)
+        If Not obj Is Nothing Then
+            nameValue = ObjectName(obj)
+            idx = ExtractTrailingIndex(nameValue)
+            If idx <> "" Then
+                If jointRecords.Exists(idx) Then
+                    Set rec = jointRecords.Item(idx)
+                    If InStr(UCase(nameValue), "JOINT BODY") > 0 Then SetField rec, "JointBodyName", nameValue
+                    If InStr(UCase(nameValue), "WELD SYMBOL") > 0 Then SetField rec, "WeldSymbolName", nameValue
+                    If LooksLikeWeldObjectName(nameValue) Then
+                        SetField rec, "WeldObjectName", nameValue
+                        Set rec.Item("_WeldObject") = obj
+                    End If
+                    If InStr(UCase(nameValue), "NEW MATERIAL") > 0 Or InStr(UCase(nameValue), "MATERIAL") > 0 Then
+                        If GetField(rec, "MaterialObjectName") = "" Then SetField rec, "MaterialObjectName", nameValue
+                    End If
+                End If
+            End If
+        End If
+    Next
+
+    sel.Clear
+    On Error GoTo 0
+End Sub
+
+Sub AddOrUpdateJointRecord(jointRecords, idx, obj)
+    Dim rec
+    If jointRecords.Exists(idx) Then
+        Set rec = jointRecords.Item(idx)
+    Else
+        Set rec = NewRecord()
+        SetField rec, "AssemblyJointIndex", idx
+        SetField rec, "WeldID", WeldIdFromIndex(idx)
+        jointRecords.Add idx, rec
+    End If
+
+    Dim nameValue
+    nameValue = ObjectName(obj)
+
+    If GetField(rec, "AssemblyJointName") = "" Then SetField rec, "AssemblyJointName", nameValue
+    If InStr(UCase(nameValue), "SPEC_") > 0 Then SetField rec, "SpecAssemblyJointName", nameValue
+    If InStr(UCase(nameValue), "MATERIAL_") > 0 Then SetField rec, "MaterialAssemblyJointName", nameValue
+
+    Dim pair
+    pair = ParsePartPairFromText(nameValue)
+    If pair = "" Then pair = ParsePartPairFromText(ParentPath(obj, 8))
+    If pair <> "" Then
+        SetField rec, "PartA_Instance", Split(pair, "|")(0)
+        SetField rec, "PartB_Instance", Split(pair, "|")(1)
+    End If
+
+    If Not rec.Exists("_JointObject") Then Set rec.Item("_JointObject") = obj
+End Sub
+
+Function IsAssemblyJointName(nameValue)
+    Dim s
+    s = UCase(CStr(nameValue))
+    IsAssemblyJointName = (InStr(s, "ASSEMBLY JOINT") > 0 Or InStr(s, "ASSEMBLYJOINT") > 0)
+End Function
+
+Function LooksLikeWeldObjectName(nameValue)
+    Dim s
+    s = UCase(CStr(nameValue))
+    LooksLikeWeldObjectName = False
+    If InStr(s, "WELD SYMBOL") > 0 Then Exit Function
+    If InStr(s, "SHAPE") > 0 Then Exit Function
+    If Left(s, 5) = "WELD." Or InStr(s, "\WELD.") > 0 Then LooksLikeWeldObjectName = True
+End Function
+
+' ---------------------------------------------------------------------------
+' Record completion
+' ---------------------------------------------------------------------------
+
+Sub CompleteJointRecord(doc, rec, productMap, defaultPosition, wpsRows)
+    Dim warning
+    warning = ""
+
+    Dim idx
+    Dim weldID
+    idx = GetField(rec, "AssemblyJointIndex")
+    weldID = WeldIdFromIndex(idx)
+    SetField rec, "WeldID", weldID
+
+    If GetField(rec, "PartA_Instance") = "" Or GetField(rec, "PartB_Instance") = "" Then
+        warning = AddWarning(warning, "PartA/PartB not parsed from Assembly Joint display name")
+    End If
+
+    Dim prodA
+    Dim prodB
+    Set prodA = ResolveProductByInstance(productMap, GetField(rec, "PartA_Instance"))
+    Set prodB = ResolveProductByInstance(productMap, GetField(rec, "PartB_Instance"))
+
+    If prodA Is Nothing Then
+        If GetField(rec, "PartA_Instance") <> "" Then warning = AddWarning(warning, "PartA not resolved")
+    Else
+        Call FillPartFields(rec, "PartA", prodA)
+    End If
+
+    If prodB Is Nothing Then
+        If GetField(rec, "PartB_Instance") <> "" Then warning = AddWarning(warning, "PartB not resolved")
+    Else
+        Call FillPartFields(rec, "PartB", prodB)
+    End If
+
+    If GetField(rec, "PartA_Material") = "" Then warning = AddWarning(warning, "PartA material missing")
+    If GetField(rec, "PartB_Material") = "" Then warning = AddWarning(warning, "PartB material missing")
+
+    Dim jointObj
+    Dim weldObj
+    Set jointObj = Nothing
+    Set weldObj = Nothing
+    If rec.Exists("_JointObject") Then Set jointObj = rec.Item("_JointObject")
+    If rec.Exists("_WeldObject") Then Set weldObj = rec.Item("_WeldObject")
+
+    Dim heightValue
+    heightValue = FirstNonEmpty(Array( _
+        ValueFromObjectOrParameter(weldObj, Array("Height(c)", "HeightC", "Height_c", "Height", "WeldSize", "Size")), _
+        ValueFromObjectOrParameter(jointObj, Array("Height(c)", "HeightC", "Height_c", "Height", "WeldSize", "Size"))))
+
+    Dim heightMm
+    heightMm = ExtractFirstNumber(heightValue)
+    If heightMm <> "" Then
+        SetField rec, "WeldType", "FW"
+        SetField rec, "Height_c_mm", heightMm
+        SetField rec, "WeldSize", "a" & TrimTrailingZeros(heightMm)
+    Else
+        SetField rec, "WeldSize", "WeldSize_MISSING"
+        warning = AddWarning(warning, "Weld size / Height(c) missing")
+    End If
+
+    Dim lengthValue
+    lengthValue = FirstNonEmpty(Array( _
+        ValueFromObjectOrParameter(weldObj, Array("WeldLength", "Length", "CurveLength")), _
+        ValueFromObjectOrParameter(jointObj, Array("WeldLength", "Length", "CurveLength"))))
+    If lengthValue <> "" Then SetField rec, "WeldLength_m", LengthToMeters(lengthValue)
+
+    SetField rec, "WeldingPosition", defaultPosition
+
+    Call TryRenameWeldObject(weldObj, weldID)
+
+    Call ApplyWpsMatch(rec, wpsRows, warning)
+    Call CalculateConsumption(rec)
+
+    If warning = "" Then
+        SetField rec, "Status", "OK"
+    Else
+        SetField rec, "Status", "MISSING_DATA"
+    End If
+    SetField rec, "Warning", warning
+End Sub
+
+Sub FillPartFields(rec, prefix, productObj)
+    SetField rec, prefix & "_Number", ProductPartNumber(productObj)
+    SetField rec, prefix & "_Name", ObjectName(productObj)
+    SetField rec, prefix & "_Material", FirstNonEmpty(Array(ProductAddedProperty(productObj, "Material"), ProductAddedProperty(productObj, "MS_Material")))
+    SetField rec, prefix & "_Dimenzija", FirstNonEmpty(Array(ProductAddedProperty(productObj, "Dimenzija"), ProductAddedProperty(productObj, "Dimension"), ProductAddedProperty(productObj, "MS_Dimension")))
+    SetField rec, prefix & "_Thickness", ExtractThickness(GetField(rec, prefix & "_Dimenzija"))
+End Sub
+
+Sub TryRenameWeldObject(weldObj, weldID)
+    If weldObj Is Nothing Then Exit Sub
+
+    Dim n
+    n = ObjectName(weldObj)
+    If UCase(n) = UCase(weldID) Then Exit Sub
+
+    On Error Resume Next
+    weldObj.Name = weldID
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Sub
+
+' ---------------------------------------------------------------------------
+' Product resolving
+' ---------------------------------------------------------------------------
+
+Sub BuildProductInstanceMap(productObj, productMap)
+    If productObj Is Nothing Then Exit Sub
+
+    Call AddProductMapKey(productMap, ObjectName(productObj), productObj)
+    Call AddProductMapKey(productMap, ProductPartNumber(productObj), productObj)
+
+    Dim children
+    Set children = Nothing
+    On Error Resume Next
+    Set children = productObj.Products
+    On Error GoTo 0
+
+    If children Is Nothing Then Exit Sub
+
+    Dim i
+    Dim child
+    For i = 1 To children.Count
+        Set child = Nothing
+        On Error Resume Next
+        Set child = children.Item(i)
+        On Error GoTo 0
+        If Not child Is Nothing Then Call BuildProductInstanceMap(child, productMap)
+    Next
+End Sub
+
+Sub AddProductMapKey(productMap, keyValue, productObj)
+    Dim k
+    k = NormalizeInstanceKey(keyValue)
+    If k = "" Then Exit Sub
+    If Not productMap.Exists(k) Then productMap.Add k, productObj
+End Sub
+
+Function ResolveProductByInstance(productMap, instanceName)
+    Set ResolveProductByInstance = Nothing
+
+    Dim k
+    k = NormalizeInstanceKey(instanceName)
+    If k = "" Then Exit Function
+
+    If productMap.Exists(k) Then
+        Set ResolveProductByInstance = productMap.Item(k)
+        Exit Function
+    End If
+
+    Dim key
+    For Each key In productMap.Keys
+        If InStr(CStr(key), k) > 0 Or InStr(k, CStr(key)) > 0 Then
+            Set ResolveProductByInstance = productMap.Item(key)
+            Exit Function
+        End If
+    Next
+End Function
+
+Function ProductPartNumber(productObj)
+    ProductPartNumber = ""
+    If productObj Is Nothing Then Exit Function
+
+    On Error Resume Next
+    ProductPartNumber = CStr(productObj.PartNumber)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ProductPartNumber = CStr(productObj.ReferenceProduct.PartNumber)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ProductPartNumber = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function ProductAddedProperty(productObj, propertyName)
+    ProductAddedProperty = FirstNonEmpty(Array( _
+        ParameterValueByKeywords(productObj, Array(propertyName)), _
+        ReferenceProductParameterValue(productObj, propertyName)))
+End Function
+
+Function ReferenceProductParameterValue(productObj, propertyName)
+    ReferenceProductParameterValue = ""
+    If productObj Is Nothing Then Exit Function
+
+    Dim refObj
+    Set refObj = Nothing
+    On Error Resume Next
+    Set refObj = productObj.ReferenceProduct
+    On Error GoTo 0
+
+    If Not refObj Is Nothing Then ReferenceProductParameterValue = ParameterValueByKeywords(refObj, Array(propertyName))
+End Function
+
+' ---------------------------------------------------------------------------
+' WPS and consumption
+' ---------------------------------------------------------------------------
+
+Function LoadWpsLibrary(doc, report)
+    Dim rows
+    Set rows = NewList()
+    Set LoadWpsLibrary = rows
+
+    Dim path
+    path = ReportPath(doc, "wps_library.csv")
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(path) Then
+        ListAdd report, "WPS library not found: " & path
+        Exit Function
+    End If
+
+    Dim ts
+    Set ts = fso.OpenTextFile(path, 1, False)
+
+    If ts.AtEndOfStream Then
+        ts.Close
+        Exit Function
+    End If
+
+    Dim headerLine
+    Dim headers
+    headerLine = ts.ReadLine
+    headers = ParseDelimitedLine(headerLine)
+
+    Do While Not ts.AtEndOfStream
+        Dim line
+        Dim values
+        Dim row
+        line = ts.ReadLine
+        If Trim(line) <> "" Then
+            values = ParseDelimitedLine(line)
+            Set row = CsvRowToDictionary(headers, values)
+            rows.Add row
+        End If
+    Loop
+    ts.Close
+
+    ListAdd report, "WPS library loaded rows: " & CStr(rows.Count)
+End Function
+
+Sub ApplyWpsMatch(rec, wpsRows, ByRef warning)
+    SetField rec, "WPS", "WPS_MISSING"
+    If wpsRows Is Nothing Then Exit Sub
+    If wpsRows.Count = 0 Then Exit Sub
+
+    Dim weldType
+    Dim weldSize
+    Dim position
+    Dim materialGroup
+    Dim maxThk
+
+    weldType = GetField(rec, "WeldType")
+    weldSize = GetField(rec, "WeldSize")
+    position = GetField(rec, "WeldingPosition")
+    materialGroup = MaterialGroupFromMaterial(FirstNonEmpty(Array(GetField(rec, "PartA_Material"), GetField(rec, "PartB_Material"))))
+    maxThk = MaxNumber(GetField(rec, "PartA_Thickness"), GetField(rec, "PartB_Thickness"))
+
+    If weldType = "" Or weldSize = "" Or weldSize = "WeldSize_MISSING" Or position = "" Then
+        warning = AddWarning(warning, "WPS matching skipped - missing weld type/size/position")
+        Exit Sub
+    End If
+
+    Dim matches
+    Set matches = NewList()
+
+    Dim i
+    Dim row
+    For i = 0 To wpsRows.Count - 1
+        Set row = wpsRows.Item(i)
+        If WpsRowMatches(row, weldType, weldSize, materialGroup, maxThk, position) Then matches.Add row
+    Next
+
+    If matches.Count = 1 Then
+        Set row = matches.Item(0)
+        SetField rec, "WPS", DictValue(row, "WPS_ID")
+        SetField rec, "WeldingProcess", DictValue(row, "Process")
+        SetField rec, "FillerTradeName", DictValue(row, "FillerTradeName")
+        SetField rec, "FillerDesignation", DictValue(row, "FillerDesignation")
+        SetField rec, "FillerDiameter", DictValue(row, "FillerDiameter")
+    ElseIf matches.Count > 1 Then
+        warning = AddWarning(warning, "Multiple WPS matches")
+    Else
+        warning = AddWarning(warning, "No matching WPS")
+    End If
+End Sub
+
+Function WpsRowMatches(row, weldType, weldSize, materialGroup, maxThk, position)
+    WpsRowMatches = False
+
+    If UCase(DictValue(row, "WeldType")) <> UCase(weldType) Then Exit Function
+    If DictValue(row, "WeldingPosition") <> "" Then
+        If InStr(UCase(DictValue(row, "WeldingPosition")), UCase(position)) = 0 Then Exit Function
+    End If
+    If DictValue(row, "MaterialGroup") <> "" And materialGroup <> "" Then
+        If UCase(DictValue(row, "MaterialGroup")) <> UCase(materialGroup) Then Exit Function
+    End If
+
+    Dim sizeValue
+    sizeValue = ExtractFirstNumber(weldSize)
+    If sizeValue <> "" Then
+        If Not NumberInRange(CDbl(sizeValue), ExtractFirstNumber(DictValue(row, "WeldSizeMin")), ExtractFirstNumber(DictValue(row, "WeldSizeMax"))) Then Exit Function
+    End If
+
+    If maxThk <> "" Then
+        If Not NumberInRange(CDbl(maxThk), ExtractFirstNumber(DictValue(row, "ThicknessMin")), ExtractFirstNumber(DictValue(row, "ThicknessMax"))) Then Exit Function
+    End If
+
+    WpsRowMatches = True
+End Function
+
+Sub CalculateConsumption(rec)
+    Dim lengthM
+    Dim height
+    Dim process
+    Dim area
+    Dim rate
+    Dim filler
+    Dim gasLiters
+    Dim gasBottles
+
+    lengthM = ExtractFirstNumber(GetField(rec, "WeldLength_m"))
+    height = ExtractFirstNumber(GetField(rec, "Height_c_mm"))
+    process = Trim(GetField(rec, "WeldingProcess"))
+
+    If lengthM = "" Or height = "" Then Exit Sub
+
+    area = CDbl(height) * CDbl(height)
+    rate = area * 0.00785 * 1.2
+    filler = CDbl(lengthM) * rate
+
+    SetField rec, "EstimatedFillerConsumption_kg", FormatNumberInvariant(filler, 3)
+
+    If process = "111" Then
+        gasLiters = 0
+        gasBottles = 0
+    ElseIf process = "131" Or process = "135" Or process = "136" Or process = "141" Then
+        gasLiters = filler * 400
+        gasBottles = gasLiters / 8000
+    Else
+        Exit Sub
+    End If
+
+    SetField rec, "EstimatedGasLiters", FormatNumberInvariant(gasLiters, 0)
+    SetField rec, "EstimatedGasBottles", FormatNumberInvariant(gasBottles, 3)
+End Sub
+
+' ---------------------------------------------------------------------------
+' CSV / report
+' ---------------------------------------------------------------------------
+
+Function RegisterHeaders()
+    RegisterHeaders = Array( _
+        "WeldID", "AssemblyJointIndex", "AssemblyJointName", _
+        "PartA_Instance", "PartA_Number", "PartA_Name", "PartA_Material", "PartA_Dimenzija", "PartA_Thickness", _
+        "PartB_Instance", "PartB_Number", "PartB_Name", "PartB_Material", "PartB_Dimenzija", "PartB_Thickness", _
+        "JointBodyName", "WeldObjectName", "WeldSymbolName", _
+        "WeldType", "WeldSize", "Height_c_mm", "WeldingPosition", _
+        "WPS", "WeldingProcess", "FillerTradeName", "FillerDesignation", "FillerDiameter", _
+        "WeldLength_m", "EstimatedFillerConsumption_kg", "EstimatedGasLiters", "EstimatedGasBottles", _
+        "Status", "Warning")
+End Function
+
+Function RecordToCsvValues(rec)
+    Dim headers
+    Dim values()
+    Dim i
+    headers = RegisterHeaders()
+    ReDim values(UBound(headers))
+
+    For i = LBound(headers) To UBound(headers)
+        values(i) = GetField(rec, CStr(headers(i)))
+    Next
+
+    RecordToCsvValues = values
+End Function
+
+Sub WriteCsvFile(filePath, headers, rows)
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim ts
+    Set ts = fso.CreateTextFile(filePath, True, False)
+    ts.WriteLine CsvLine(headers)
+
+    Dim i
+    For i = 0 To rows.Count - 1
+        ts.WriteLine CsvLine(rows.Item(i))
+    Next
+    ts.Close
+End Sub
+
+Sub WriteTextFile(filePath, lines)
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim ts
+    Set ts = fso.CreateTextFile(filePath, True, False)
+
+    Dim i
+    For i = 0 To lines.Count - 1
+        ts.WriteLine SafeText(lines.Item(i))
+    Next
+    ts.Close
+End Sub
+
+Sub AppendRegisterSummary(report, jointRecords)
+    Dim total
+    Dim parsed
+    Dim resolved
+    Dim materials
+    Dim thickness
+    Dim symbols
+    Dim sizes
+    Dim wps
+    Dim missing
+
+    total = jointRecords.Count
+    parsed = 0
+    resolved = 0
+    materials = 0
+    thickness = 0
+    symbols = 0
+    sizes = 0
+    wps = 0
+    missing = 0
+
+    Dim key
+    Dim rec
+    For Each key In jointRecords.Keys
+        Set rec = jointRecords.Item(key)
+        If GetField(rec, "PartA_Instance") <> "" And GetField(rec, "PartB_Instance") <> "" Then parsed = parsed + 1
+        If GetField(rec, "PartA_Number") <> "" And GetField(rec, "PartB_Number") <> "" Then resolved = resolved + 1
+        If GetField(rec, "PartA_Material") <> "" And GetField(rec, "PartB_Material") <> "" Then materials = materials + 1
+        If GetField(rec, "PartA_Thickness") <> "" And GetField(rec, "PartB_Thickness") <> "" Then thickness = thickness + 1
+        If GetField(rec, "WeldSymbolName") <> "" Then symbols = symbols + 1
+        If GetField(rec, "WeldSize") <> "" And GetField(rec, "WeldSize") <> "WeldSize_MISSING" Then sizes = sizes + 1
+        If GetField(rec, "WPS") <> "" And GetField(rec, "WPS") <> "WPS_MISSING" Then wps = wps + 1
+        If GetField(rec, "Warning") <> "" Then missing = missing + 1
+    Next
+
+    ListAdd report, ""
+    ListAdd report, "Summary:"
+    ListAdd report, "Total Assembly Joints found: " & CStr(total)
+    ListAdd report, "Weld IDs assigned: " & CStr(total)
+    ListAdd report, "PartA/PartB parsed: " & CStr(parsed)
+    ListAdd report, "PartA/PartB resolved: " & CStr(resolved)
+    ListAdd report, "Materials read: " & CStr(materials)
+    ListAdd report, "Thickness read: " & CStr(thickness)
+    ListAdd report, "Weld Symbols linked: " & CStr(symbols)
+    ListAdd report, "Weld sizes read: " & CStr(sizes)
+    ListAdd report, "WPS assigned: " & CStr(wps)
+    ListAdd report, "Missing data: " & CStr(missing)
+End Sub
+
+' ---------------------------------------------------------------------------
+' Record helpers
+' ---------------------------------------------------------------------------
+
+Function NewRecord()
+    Dim rec
+    Set rec = NewDictionary()
+    Dim headers
+    Dim i
+    headers = RegisterHeaders()
+    For i = LBound(headers) To UBound(headers)
+        rec.Add CStr(headers(i)), ""
+    Next
+    Set NewRecord = rec
+End Function
+
+Sub SetField(rec, fieldName, value)
+    If rec.Exists(CStr(fieldName)) Then
+        rec.Item(CStr(fieldName)) = SafeText(value)
+    Else
+        rec.Add CStr(fieldName), SafeText(value)
+    End If
+End Sub
+
+Function GetField(rec, fieldName)
+    If rec Is Nothing Then
+        GetField = ""
+    ElseIf rec.Exists(CStr(fieldName)) Then
+        GetField = CStr(rec.Item(CStr(fieldName)))
+    Else
+        GetField = ""
+    End If
+End Function
+
+Function NewDictionary()
+    Dim d
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+    Set NewDictionary = d
+End Function
+
+Function NewList()
+    Set NewList = CreateObject("System.Collections.ArrayList")
+End Function
+
+Sub ListAdd(listObj, value)
+    listObj.Add SafeText(value)
+End Sub
+
+' ---------------------------------------------------------------------------
+' Generic CATIA helpers
+' ---------------------------------------------------------------------------
+
+Function SelectionCount(sel)
+    SelectionCount = 0
+    On Error Resume Next
+    SelectionCount = CLng(sel.Count2)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = CLng(sel.Count)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SelectionItemValue(sel, indexValue)
+    Set SelectionItemValue = Nothing
+    On Error Resume Next
+    Set SelectionItemValue = sel.Item2(CLng(indexValue)).Value
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set SelectionItemValue = sel.Item(CLng(indexValue)).Value
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set SelectionItemValue = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+Function ObjectName(obj)
+    ObjectName = ""
+    If obj Is Nothing Then Exit Function
+    On Error Resume Next
+    ObjectName = CStr(obj.Name)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ObjectName = CStr(obj.PartNumber)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ObjectName = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function ParentPath(obj, maxDepth)
+    ParentPath = ""
+    If obj Is Nothing Then Exit Function
+
+    Dim current
+    Dim depth
+    Dim piece
+    Set current = obj
+    depth = 0
+
+    On Error Resume Next
+    Do While Not current Is Nothing And depth < maxDepth
+        piece = TypeName(current) & ":" & ObjectName(current)
+        If ParentPath = "" Then
+            ParentPath = piece
+        Else
+            ParentPath = piece & " > " & ParentPath
+        End If
+        Set current = current.Parent
+        If Err.Number <> 0 Then
+            Err.Clear
+            Exit Do
+        End If
+        depth = depth + 1
+    Loop
+    On Error GoTo 0
+End Function
+
+Function ValueFromObjectOrParameter(obj, names)
+    ValueFromObjectOrParameter = ""
+    If obj Is Nothing Then Exit Function
+
+    Dim i
+    Dim value
+    For i = LBound(names) To UBound(names)
+        value = ProbeScalarValue(obj, CStr(names(i)))
+        If value <> "" Then
+            ValueFromObjectOrParameter = value
+            Exit Function
+        End If
+        value = ParameterValueByKeywords(obj, Array(CStr(names(i))))
+        If value <> "" Then
+            ValueFromObjectOrParameter = value
+            Exit Function
+        End If
+    Next
+End Function
+
+Function ProbeScalarValue(obj, propertyName)
+    ProbeScalarValue = ""
+    If obj Is Nothing Then Exit Function
+    If Not IsAutomationIdentifier(propertyName) Then Exit Function
+
+    On Error Resume Next
+    Dim v
+    v = Eval("obj." & CStr(propertyName))
+    If Err.Number = 0 Then ProbeScalarValue = ScalarToString(v)
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Function ParameterValueByKeywords(obj, keywords)
+    ParameterValueByKeywords = ""
+    If obj Is Nothing Then Exit Function
+
+    Dim collections
+    Set collections = NewList()
+    Call AddCollectionIfAccessible(collections, obj, "Parameters")
+    Call AddCollectionIfAccessible(collections, obj, "UserRefProperties")
+
+    Dim c
+    Dim params
+    For c = 0 To collections.Count - 1
+        Set params = collections.Item(c)
+        ParameterValueByKeywords = ParameterValueFromCollection(params, keywords)
+        If ParameterValueByKeywords <> "" Then Exit Function
+    Next
+End Function
+
+Sub AddCollectionIfAccessible(collections, obj, propertyName)
+    If obj Is Nothing Then Exit Sub
+    If Not IsAutomationIdentifier(propertyName) Then Exit Sub
+
+    Dim collectionObj
+    Set collectionObj = Nothing
+    On Error Resume Next
+    Execute "Set collectionObj = obj." & CStr(propertyName)
+    If Err.Number = 0 And Not collectionObj Is Nothing Then collections.Add collectionObj
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Sub
+
+Function ParameterValueFromCollection(params, keywords)
+    ParameterValueFromCollection = ""
+    If params Is Nothing Then Exit Function
+
+    Dim i
+    Dim p
+    Dim k
+    Dim pName
+    Dim wanted
+
+    On Error Resume Next
+    For i = 1 To params.Count
+        Set p = Nothing
+        Set p = params.Item(i)
+        If Err.Number = 0 And Not p Is Nothing Then
+            pName = NormalizeName(ObjectName(p))
+            For k = LBound(keywords) To UBound(keywords)
+                wanted = NormalizeName(CStr(keywords(k)))
+                If wanted <> "" And (pName = wanted Or InStr(pName, wanted) > 0) Then
+                    ParameterValueFromCollection = ParameterDisplayValue(p)
+                    If ParameterValueFromCollection <> "" Then
+                        On Error GoTo 0
+                        Exit Function
+                    End If
+                End If
+            Next
+        End If
+        If Err.Number <> 0 Then Err.Clear
+    Next
+    On Error GoTo 0
+End Function
+
+Function ParameterDisplayValue(p)
+    ParameterDisplayValue = FirstNonEmpty(Array(ProbeScalarValue(p, "ValueAsString"), ProbeScalarValue(p, "Value"), ProbeScalarValue(p, "Magnitude")))
+End Function
+
+' ---------------------------------------------------------------------------
+' Parsing / formatting helpers
+' ---------------------------------------------------------------------------
+
+Function ExtractAssemblyJointIndex(textValue)
+    ExtractAssemblyJointIndex = ExtractIndexAfterPhrase(CStr(textValue), "Assembly Joint.")
+    If ExtractAssemblyJointIndex = "" Then ExtractAssemblyJointIndex = ExtractIndexAfterPhrase(CStr(textValue), "AssemblyJoint.")
+End Function
+
+Function ExtractTrailingIndex(textValue)
+    Dim s
+    Dim i
+    Dim ch
+    Dim digits
+    s = CStr(textValue)
+    digits = ""
+
+    For i = Len(s) To 1 Step -1
+        ch = Mid(s, i, 1)
+        If ch >= "0" And ch <= "9" Then
+            digits = ch & digits
+        ElseIf digits <> "" Then
+            Exit For
+        End If
+    Next
+    ExtractTrailingIndex = digits
+End Function
+
+Function ExtractIndexAfterPhrase(textValue, phrase)
+    Dim p
+    Dim i
+    Dim ch
+    Dim digits
+    p = InStr(1, textValue, phrase, 1)
+    digits = ""
+    If p = 0 Then
+        ExtractIndexAfterPhrase = ""
+        Exit Function
+    End If
+    i = p + Len(phrase)
+    Do While i <= Len(textValue)
+        ch = Mid(textValue, i, 1)
+        If ch >= "0" And ch <= "9" Then
+            digits = digits & ch
+        Else
+            Exit Do
+        End If
+        i = i + 1
+    Loop
+    ExtractIndexAfterPhrase = digits
+End Function
+
+Function ParsePartPairFromText(textValue)
+    ParsePartPairFromText = ""
+    Dim s
+    Dim openPos
+    Dim closePos
+    Dim innerText
+    Dim pieces
+    s = CStr(textValue)
+
+    openPos = InStr(s, "(")
+    closePos = InStrRev(s, ")")
+    If openPos = 0 Or closePos <= openPos Then Exit Function
+
+    innerText = Mid(s, openPos + 1, closePos - openPos - 1)
+    pieces = Split(innerText, ",")
+    If UBound(pieces) < 1 Then Exit Function
+
+    ParsePartPairFromText = Trim(CStr(pieces(0))) & "|" & Trim(CStr(pieces(1)))
+End Function
+
+Function WeldIdFromIndex(indexValue)
+    WeldIdFromIndex = "W" & Right("000" & CStr(CLng(indexValue)), 3)
+End Function
+
+Function ExtractThickness(dimValue)
+    ExtractThickness = ""
+    Dim s
+    Dim parts
+    s = Replace(UCase(CStr(dimValue)), " ", "")
+    s = Replace(s, ChrW(216), "")
+    s = Replace(s, "Ø", "")
+    s = Replace(s, "MM", "")
+    s = Replace(s, ",", ".")
+    If s = "" Then Exit Function
+
+    If InStr(s, "X") > 0 Then
+        parts = Split(s, "X")
+        If Left(UCase(CStr(dimValue)), 1) = ChrW(216) Or Left(CStr(dimValue), 1) = "Ø" Then
+            ExtractThickness = ExtractFirstNumber(parts(UBound(parts)))
+        ElseIf UBound(parts) = 1 And CDblOrZero(parts(0)) > 100 Then
+            ExtractThickness = ExtractFirstNumber(parts(1))
+        Else
+            ExtractThickness = ExtractFirstNumber(parts(0))
+        End If
+    Else
+        ExtractThickness = ExtractFirstNumber(s)
+    End If
+End Function
+
+Function ExtractFirstNumber(value)
+    Dim s
+    Dim i
+    Dim ch
+    Dim started
+    Dim out
+    s = Replace(CStr(value), ",", ".")
+    out = ""
+    started = False
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        If (ch >= "0" And ch <= "9") Or ch = "." Then
+            out = out & ch
+            started = True
+        ElseIf started Then
+            Exit For
+        End If
+    Next
+    ExtractFirstNumber = out
+End Function
+
+Function LengthToMeters(value)
+    Dim n
+    n = ExtractFirstNumber(value)
+    If n = "" Then
+        LengthToMeters = ""
+    ElseIf InStr(UCase(CStr(value)), "MM") > 0 Then
+        LengthToMeters = FormatNumberInvariant(CDbl(n) / 1000, 3)
+    Else
+        LengthToMeters = FormatNumberInvariant(CDbl(n), 3)
+    End If
+End Function
+
+Function TrimTrailingZeros(value)
+    Dim s
+    s = CStr(value)
+    If InStr(s, ".") > 0 Then
+        Do While Right(s, 1) = "0"
+            s = Left(s, Len(s) - 1)
+        Loop
+        If Right(s, 1) = "." Then s = Left(s, Len(s) - 1)
+    End If
+    TrimTrailingZeros = s
+End Function
+
+Function FormatNumberInvariant(value, decimals)
+    FormatNumberInvariant = Replace(CStr(Round(CDbl(value), CInt(decimals))), ",", ".")
+End Function
+
+Function ScalarToString(value)
+    On Error Resume Next
+    ScalarToString = CStr(value)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ScalarToString = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function NormalizeName(value)
+    Dim s
+    s = UCase(CStr(value))
+    s = Replace(s, " ", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "\", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, "(", "")
+    s = Replace(s, ")", "")
+    NormalizeName = s
+End Function
+
+Function NormalizeInstanceKey(value)
+    NormalizeInstanceKey = UCase(Trim(CStr(value)))
+End Function
+
+Function IsAutomationIdentifier(value)
+    Dim s
+    Dim i
+    Dim ch
+    s = CStr(value)
+    If s = "" Then
+        IsAutomationIdentifier = False
+        Exit Function
+    End If
+    ch = Mid(s, 1, 1)
+    If Not ((ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Or ch = "_") Then
+        IsAutomationIdentifier = False
+        Exit Function
+    End If
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        If Not ((ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Or (ch >= "0" And ch <= "9") Or ch = "_") Then
+            IsAutomationIdentifier = False
+            Exit Function
+        End If
+    Next
+    IsAutomationIdentifier = True
+End Function
+
+Function CsvLine(values)
+    Dim i
+    Dim line
+    line = ""
+    For i = LBound(values) To UBound(values)
+        If i > LBound(values) Then line = line & ";"
+        line = line & CsvCell(values(i))
+    Next
+    CsvLine = line
+End Function
+
+Function CsvCell(value)
+    Dim s
+    s = SafeText(value)
+    If InStr(s, """") > 0 Or InStr(s, ";") > 0 Or InStr(s, ",") > 0 Then
+        s = Replace(s, """", """""")
+        CsvCell = """" & s & """"
+    Else
+        CsvCell = s
+    End If
+End Function
+
+Function ParseDelimitedLine(line)
+    Dim delimiter
+    If InStr(line, ";") > 0 Then
+        delimiter = ";"
+    ElseIf InStr(line, "|") > 0 Then
+        delimiter = "|"
+    Else
+        delimiter = ","
+    End If
+    ParseDelimitedLine = Split(line, delimiter)
+End Function
+
+Function CsvRowToDictionary(headers, values)
+    Dim d
+    Set d = NewDictionary()
+    Dim i
+    For i = LBound(headers) To UBound(headers)
+        If i <= UBound(values) Then
+            d.Add Trim(CStr(headers(i))), Trim(CStr(values(i)))
+        Else
+            d.Add Trim(CStr(headers(i))), ""
+        End If
+    Next
+    Set CsvRowToDictionary = d
+End Function
+
+Function DictValue(d, key)
+    If d Is Nothing Then
+        DictValue = ""
+    ElseIf d.Exists(CStr(key)) Then
+        DictValue = CStr(d.Item(CStr(key)))
+    Else
+        DictValue = ""
+    End If
+End Function
+
+Function SortedNumericKeys(dict)
+    Dim arr()
+    Dim i
+    Dim j
+    Dim key
+    Dim temp
+    ReDim arr(dict.Count - 1)
+    i = 0
+    For Each key In dict.Keys
+        arr(i) = CLng(key)
+        i = i + 1
+    Next
+    For i = LBound(arr) To UBound(arr) - 1
+        For j = i + 1 To UBound(arr)
+            If CLng(arr(j)) < CLng(arr(i)) Then
+                temp = arr(i)
+                arr(i) = arr(j)
+                arr(j) = temp
+            End If
+        Next
+    Next
+    SortedNumericKeys = arr
+End Function
+
+Function AddWarning(existing, newWarning)
+    If CStr(existing) = "" Then
+        AddWarning = CStr(newWarning)
+    Else
+        AddWarning = CStr(existing) & " | " & CStr(newWarning)
+    End If
+End Function
+
+Function MaterialGroupFromMaterial(material)
+    Dim s
+    s = UCase(CStr(material))
+    If InStr(s, "S235JR") > 0 Or InStr(s, "DD11") > 0 Then
+        MaterialGroupFromMaterial = "1.1"
+    Else
+        MaterialGroupFromMaterial = ""
+    End If
+End Function
+
+Function NumberInRange(value, minValue, maxValue)
+    NumberInRange = True
+    If minValue <> "" Then If CDbl(value) < CDbl(minValue) Then NumberInRange = False
+    If maxValue <> "" Then If CDbl(value) > CDbl(maxValue) Then NumberInRange = False
+End Function
+
+Function MaxNumber(a, b)
+    Dim na
+    Dim nb
+    na = ExtractFirstNumber(a)
+    nb = ExtractFirstNumber(b)
+    If na = "" And nb = "" Then
+        MaxNumber = ""
+    ElseIf na = "" Then
+        MaxNumber = nb
+    ElseIf nb = "" Then
+        MaxNumber = na
+    ElseIf CDbl(na) >= CDbl(nb) Then
+        MaxNumber = na
+    Else
+        MaxNumber = nb
+    End If
+End Function
+
+Function CDblOrZero(value)
+    On Error Resume Next
+    CDblOrZero = CDbl(ExtractFirstNumber(value))
+    If Err.Number <> 0 Then
+        Err.Clear
+        CDblOrZero = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function FirstNonEmpty(values)
+    Dim i
+    Dim v
+    FirstNonEmpty = ""
+    For i = LBound(values) To UBound(values)
+        v = Trim(CStr(values(i)))
+        If v <> "" Then
+            FirstNonEmpty = v
+            Exit Function
+        End If
+    Next
+End Function
+
+Function SafeText(value)
+    On Error Resume Next
+    Dim s
+    If IsNull(value) Then
+        SafeText = "<Null>"
+        Exit Function
+    End If
+    If IsEmpty(value) Then
+        SafeText = ""
+        Exit Function
+    End If
+    s = CStr(value)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeText = "<CStr failed>"
+        Exit Function
+    End If
+    s = Replace(s, Chr(0), "")
+    s = Replace(s, vbCrLf, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    SafeText = s
+End Function
+
+Function ReportPath(doc, fileName)
+    Dim folderPath
+    folderPath = ""
+    On Error Resume Next
+    folderPath = CStr(doc.Path)
+    If Err.Number <> 0 Then
+        Err.Clear
+        folderPath = ""
+    End If
+    On Error GoTo 0
+    If folderPath = "" Then folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+    ReportPath = CreateObject("Scripting.FileSystemObject").BuildPath(folderPath, fileName)
+End Function
+
+Function SafeDocumentName(doc)
+    SafeDocumentName = ObjectName(doc)
+    On Error Resume Next
+    If SafeDocumentName = "" Then SafeDocumentName = CStr(doc.FullName)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeDocumentName = "<active document>"
+    End If
+    On Error GoTo 0
+End Function

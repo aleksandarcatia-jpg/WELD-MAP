@@ -1,0 +1,790 @@
+Option Explicit
+
+' ---------------------------------------------------------------------------
+' GenerateWeldTablesFromRegister.CATScript
+'
+' Drawing table macro for Weld Design workflow.
+' Reads weld_design_register.csv and creates only:
+'   1. TABELA ZAVARENIH SPOJEVA
+'   2. UTROSAK DODATNOG MATERIJALA
+' plus a short ZAKLJUCAK summary.
+' ---------------------------------------------------------------------------
+
+Const MACRO_NAME = "GenerateWeldTablesFromRegister"
+Const REGISTER_FILE_NAME = "weld_design_register.csv"
+
+Sub CATMain()
+    Dim doc
+    Set doc = Nothing
+
+    On Error Resume Next
+    Set doc = CATIA.ActiveDocument
+    On Error GoTo 0
+
+    If doc Is Nothing Then
+        MsgBox "Open CATDrawing and run this macro again.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    If TypeName(doc) <> "DrawingDocument" Then
+        MsgBox "Active document must be CATDrawing.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim registerPath
+    registerPath = ResolveRegisterPath(doc)
+    If registerPath = "" Then Exit Sub
+
+    Dim records
+    Set records = LoadRegisterCsv(registerPath)
+    If records.Count = 0 Then
+        MsgBox "No rows found in weld_design_register.csv.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim targetSheet
+    If records.Count > 20 Then
+        If AskYesNo("Register has many welds." & vbCrLf & "Create WELD_TABLE sheet? Yes/No", True) Then
+            Set targetSheet = CreateOrGetSheet(doc, "WELD_TABLE")
+        Else
+            Set targetSheet = doc.Sheets.ActiveSheet
+        End If
+    Else
+        If AskYesNo("Create WELD_TABLE sheet? Yes/No", False) Then
+            Set targetSheet = CreateOrGetSheet(doc, "WELD_TABLE")
+        Else
+            Set targetSheet = doc.Sheets.ActiveSheet
+        End If
+    End If
+
+    If targetSheet Is Nothing Then
+        MsgBox "Could not resolve target drawing sheet.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim bomPositions
+    Set bomPositions = BuildBomPositionMap(targetSheet)
+
+    Dim jointHeaders
+    Dim jointRows
+    jointHeaders = JointTableHeaders()
+    Set jointRows = BuildJointTableRows(records, bomPositions)
+
+    Dim consumptionHeaders
+    Dim consumptionRows
+    consumptionHeaders = ConsumptionTableHeaders()
+    Set consumptionRows = BuildConsumptionRows(records)
+
+    Dim table1Ok
+    Dim table2Ok
+    Dim summaryOk
+    table1Ok = AddDrawingTable(targetSheet, "TABELA ZAVARENIH SPOJEVA", jointHeaders, jointRows, 20, 180)
+    table2Ok = AddDrawingTable(targetSheet, MaterialConsumptionTitle(), consumptionHeaders, consumptionRows, 20, 180 - ((jointRows.Count + 5) * 5.5) - 18)
+    summaryOk = AddSummaryText(targetSheet, records, 20, 180 - ((jointRows.Count + consumptionRows.Count + 12) * 5.5) - 30)
+
+    MsgBox "Weld tables from register completed." & vbCrLf & _
+           "TABELA ZAVARENIH SPOJEVA created: " & YesNoText(table1Ok) & vbCrLf & _
+           "UTROSAK DODATNOG MATERIJALA created: " & YesNoText(table2Ok) & vbCrLf & _
+           "ZAKLJUCAK created: " & YesNoText(summaryOk), vbInformation, MACRO_NAME
+End Sub
+
+' ---------------------------------------------------------------------------
+' Table data
+' ---------------------------------------------------------------------------
+
+Function JointTableHeaders()
+    JointTableHeaders = Array("Br. zav. spoja", "Poz. / Poz.", "Debljina / Debljina", _
+                              "Materijal / Materijal", "Br. WPS liste", "Postupak", _
+                              ChrW(381) & "ica / dodatni materijal")
+End Function
+
+Function ConsumptionTableHeaders()
+    ConsumptionTableHeaders = Array("Postupak", "Dodatni materijal", "Oznaka", ChrW(216), _
+                                    "Ukupna duzina zavara [m]", "Procena potrosnje [kg]", _
+                                    "Potrosnja gasa [L]", "Potrosnja gasa [boce]")
+End Function
+
+Function MaterialConsumptionTitle()
+    MaterialConsumptionTitle = "UTRO" & ChrW(352) & "AK DODATNOG MATERIJALA"
+End Function
+
+Function BuildJointTableRows(records, bomPositions)
+    Dim rows
+    Set rows = NewList()
+    Set BuildJointTableRows = rows
+
+    Dim i
+    Dim rec
+    For i = 0 To records.Count - 1
+        Set rec = records.Item(i)
+        rows.Add Array( _
+            DictValue(rec, "WeldID"), _
+            PositionPair(rec, bomPositions), _
+            CombineThickness(DictValue(rec, "PartA_Thickness"), DictValue(rec, "PartB_Thickness")), _
+            CombineSame(DictValue(rec, "PartA_Material"), DictValue(rec, "PartB_Material")), _
+            DictValue(rec, "WPS"), _
+            DictValue(rec, "WeldingProcess"), _
+            FillerText(rec))
+    Next
+End Function
+
+Function BuildConsumptionRows(records)
+    Dim groups
+    Set groups = NewDictionary()
+
+    Dim i
+    Dim rec
+    Dim key
+    Dim g
+
+    For i = 0 To records.Count - 1
+        Set rec = records.Item(i)
+        key = DictValue(rec, "WeldingProcess") & "|" & DictValue(rec, "FillerTradeName") & "|" & _
+              DictValue(rec, "FillerDesignation") & "|" & DictValue(rec, "FillerDiameter")
+        If Not groups.Exists(key) Then
+            Set g = NewDictionary()
+            g.Add "Process", DictValue(rec, "WeldingProcess")
+            g.Add "Trade", DictValue(rec, "FillerTradeName")
+            g.Add "Designation", DictValue(rec, "FillerDesignation")
+            g.Add "Diameter", DictValue(rec, "FillerDiameter")
+            g.Add "Length", CDbl(0)
+            g.Add "Filler", CDbl(0)
+            g.Add "GasL", CDbl(0)
+            g.Add "GasB", CDbl(0)
+            groups.Add key, g
+        End If
+
+        Set g = groups.Item(key)
+        g.Item("Length") = CDbl(g.Item("Length")) + NumberValue(DictValue(rec, "WeldLength_m"))
+        g.Item("Filler") = CDbl(g.Item("Filler")) + NumberValue(DictValue(rec, "EstimatedFillerConsumption_kg"))
+        g.Item("GasL") = CDbl(g.Item("GasL")) + NumberValue(DictValue(rec, "EstimatedGasLiters"))
+        g.Item("GasB") = CDbl(g.Item("GasB")) + NumberValue(DictValue(rec, "EstimatedGasBottles"))
+    Next
+
+    Dim rows
+    Set rows = NewList()
+
+    Dim groupKey
+    For Each groupKey In groups.Keys
+        Set g = groups.Item(groupKey)
+        rows.Add Array( _
+            CStr(g.Item("Process")), _
+            CStr(g.Item("Trade")), _
+            CStr(g.Item("Designation")), _
+            CStr(g.Item("Diameter")), _
+            FormatNumberInvariant(CDbl(g.Item("Length")), 2), _
+            FormatNumberInvariant(CDbl(g.Item("Filler")), 2), _
+            FormatNumberInvariant(CDbl(g.Item("GasL")), 0), _
+            FormatNumberInvariant(CDbl(g.Item("GasB")), 2))
+    Next
+
+    Set BuildConsumptionRows = rows
+End Function
+
+Function PositionPair(rec, bomPositions)
+    Dim a
+    Dim b
+    a = DictValue(rec, "PartA_Number")
+    b = DictValue(rec, "PartB_Number")
+
+    If Not bomPositions Is Nothing Then
+        If bomPositions.Exists(NormalizeKey(a)) Then a = bomPositions.Item(NormalizeKey(a))
+        If bomPositions.Exists(NormalizeKey(b)) Then b = bomPositions.Item(NormalizeKey(b))
+    End If
+
+    PositionPair = CombinePair(a, b)
+End Function
+
+Function CombineThickness(a, b)
+    Dim value
+    value = CombineSame(CleanMm(a), CleanMm(b))
+    If value <> "" And InStr(UCase(value), "MM") = 0 Then value = value & " mm"
+    CombineThickness = value
+End Function
+
+Function CombineSame(a, b)
+    a = Trim(CStr(a))
+    b = Trim(CStr(b))
+
+    If a = "" Then
+        CombineSame = b
+    ElseIf b = "" Then
+        CombineSame = a
+    ElseIf UCase(a) = UCase(b) Then
+        CombineSame = a
+    Else
+        CombineSame = a & " / " & b
+    End If
+End Function
+
+Function CombinePair(a, b)
+    a = Trim(CStr(a))
+    b = Trim(CStr(b))
+    If a = "" Then
+        CombinePair = b
+    ElseIf b = "" Then
+        CombinePair = a
+    Else
+        CombinePair = a & " / " & b
+    End If
+End Function
+
+Function FillerText(rec)
+    Dim parts
+    Set parts = NewList()
+    If DictValue(rec, "FillerTradeName") <> "" Then parts.Add DictValue(rec, "FillerTradeName")
+    If DictValue(rec, "FillerDesignation") <> "" Then parts.Add DictValue(rec, "FillerDesignation")
+    If DictValue(rec, "FillerDiameter") <> "" Then parts.Add ChrW(216) & DictValue(rec, "FillerDiameter")
+    FillerText = JoinList(parts, " / ")
+End Function
+
+Function JoinList(listObj, separator)
+    Dim i
+    Dim s
+    s = ""
+    For i = 0 To listObj.Count - 1
+        If s <> "" Then s = s & separator
+        s = s & CStr(listObj.Item(i))
+    Next
+    JoinList = s
+End Function
+
+' ---------------------------------------------------------------------------
+' BOM mapping from existing drawing tables
+' ---------------------------------------------------------------------------
+
+Function BuildBomPositionMap(sheet)
+    Dim map
+    Set map = NewDictionary()
+    Set BuildBomPositionMap = map
+
+    If sheet Is Nothing Then Exit Function
+
+    Dim views
+    Set views = Nothing
+    On Error Resume Next
+    Set views = sheet.Views
+    If Err.Number <> 0 Or views Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    Dim v
+    Dim view
+    Dim tables
+    Dim t
+    Dim table
+
+    For v = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(v)
+        Set tables = view.Tables
+        If Err.Number = 0 And Not tables Is Nothing Then
+            For t = 1 To tables.Count
+                Set table = tables.Item(t)
+                Call AddBomMapFromTable(table, map)
+            Next
+        End If
+        If Err.Number <> 0 Then Err.Clear
+        On Error GoTo 0
+    Next
+End Function
+
+Sub AddBomMapFromTable(table, map)
+    If table Is Nothing Then Exit Sub
+
+    Dim rowCount
+    Dim colCount
+    rowCount = TableRowCount(table)
+    colCount = TableColumnCount(table)
+    If rowCount < 2 Or colCount < 2 Then Exit Sub
+
+    Dim positionCol
+    Dim partCol
+    positionCol = 0
+    partCol = 0
+
+    Dim c
+    Dim header
+    For c = 1 To colCount
+        header = NormalizeHeader(TableCell(table, 1, c))
+        If positionCol = 0 Then
+            If header = "POZ" Or header = "POSITION" Or header = "ITEM" Or header = "ITEMNO" Then positionCol = c
+        End If
+        If partCol = 0 Then
+            If header = "BROJCRTEZA" Or header = "DRAWINGNO" Or header = "PARTNUMBER" Or header = "PARTNO" Then partCol = c
+        End If
+    Next
+
+    If positionCol = 0 Or partCol = 0 Then Exit Sub
+
+    Dim r
+    Dim pos
+    Dim partNo
+    For r = 2 To rowCount
+        pos = Trim(TableCell(table, r, positionCol))
+        partNo = Trim(TableCell(table, r, partCol))
+        If pos <> "" And partNo <> "" Then
+            If Not map.Exists(NormalizeKey(partNo)) Then map.Add NormalizeKey(partNo), pos
+        End If
+    Next
+End Sub
+
+' ---------------------------------------------------------------------------
+' Drawing creation
+' ---------------------------------------------------------------------------
+
+Function AddDrawingTable(sheet, title, headers, rows, x, y)
+    AddDrawingTable = False
+
+    Dim view
+    Set view = GetTableView(sheet)
+    If view Is Nothing Then Exit Function
+
+    Dim tables
+    Dim table
+    Set tables = Nothing
+    Set table = Nothing
+
+    Dim rowCount
+    Dim colCount
+    rowCount = rows.Count + 1
+    colCount = UBound(headers) - LBound(headers) + 1
+
+    On Error Resume Next
+    Set tables = view.Tables
+    Set table = tables.Add(CDbl(x), CDbl(y), rowCount, colCount, 5.5, 22.0)
+    If Err.Number <> 0 Or table Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        AddDrawingTable = AddTextTableFallback(view, title, headers, rows, x, y)
+        Exit Function
+    End If
+
+    Call AddTitleText(view, title, CDbl(x), CDbl(y) + 7.0)
+    table.Name = SafeTableName(title)
+
+    Dim r
+    Dim c
+    Dim row
+    For c = 1 To colCount
+        table.SetCellString 1, c, CStr(headers(c - 1))
+        Call FormatCell(table, 1, c, 2.5, True)
+    Next
+
+    For r = 0 To rows.Count - 1
+        row = rows.Item(r)
+        For c = 1 To colCount
+            table.SetCellString r + 2, c, CStr(row(c - 1))
+            Call FormatCell(table, r + 2, c, 2.5, False)
+        Next
+    Next
+
+    For c = 1 To colCount
+        table.SetColumnSize c, ColumnWidth(headers(c - 1))
+    Next
+    For r = 1 To rowCount
+        table.SetRowSize r, 5.5
+    Next
+
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+    AddDrawingTable = True
+End Function
+
+Function AddSummaryText(sheet, records, x, y)
+    AddSummaryText = False
+
+    Dim view
+    Set view = GetTableView(sheet)
+    If view Is Nothing Then Exit Function
+
+    Dim totalLength
+    Dim totalFiller
+    Dim totalGasL
+    Dim totalGasB
+    Dim i
+    Dim rec
+    totalLength = 0
+    totalFiller = 0
+    totalGasL = 0
+    totalGasB = 0
+
+    For i = 0 To records.Count - 1
+        Set rec = records.Item(i)
+        totalLength = totalLength + NumberValue(DictValue(rec, "WeldLength_m"))
+        totalFiller = totalFiller + NumberValue(DictValue(rec, "EstimatedFillerConsumption_kg"))
+        totalGasL = totalGasL + NumberValue(DictValue(rec, "EstimatedGasLiters"))
+        totalGasB = totalGasB + NumberValue(DictValue(rec, "EstimatedGasBottles"))
+    Next
+
+    Dim textValue
+    textValue = "ZAKLJU" & ChrW(268) & "AK" & vbCrLf & _
+                "Ukupna duzina zavara: " & FormatNumberInvariant(totalLength, 2) & " m" & vbCrLf & _
+                "Ukupna procenjena potrosnja dodatnog materijala: " & FormatNumberInvariant(totalFiller, 2) & " kg" & vbCrLf & _
+                "Ukupna potrosnja gasa: " & FormatNumberInvariant(totalGasL, 0) & " L" & vbCrLf & _
+                "Ukupna potrosnja gasa: " & FormatNumberInvariant(totalGasB, 2) & " boca"
+
+    Dim txt
+    Set txt = Nothing
+    On Error Resume Next
+    Set txt = view.Texts.Add(textValue, CDbl(x), CDbl(y))
+    If Err.Number = 0 And Not txt Is Nothing Then
+        txt.Name = "ZAKLJUCAK_WELD_SUMMARY"
+        txt.SetFontSize 0, 0, 2.8
+        AddSummaryText = True
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Sub AddTitleText(view, title, x, y)
+    Dim txt
+    Set txt = Nothing
+    On Error Resume Next
+    Set txt = view.Texts.Add(CStr(title), CDbl(x), CDbl(y))
+    If Not txt Is Nothing Then
+        txt.Name = SafeTableName(title) & "_TITLE"
+        txt.SetFontSize 0, 0, 3.0
+        txt.SetFontStyle 0, 0, 1
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Sub
+
+Sub FormatCell(table, rowIndex, colIndex, fontSize, bold)
+    Dim txt
+    Set txt = Nothing
+    On Error Resume Next
+    Set txt = table.GetCellObject(CLng(rowIndex), CLng(colIndex))
+    If Not txt Is Nothing Then
+        txt.SetFontSize 0, 0, CDbl(fontSize)
+        If CBool(bold) Then txt.SetFontStyle 0, 0, 1
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Sub
+
+Function AddTextTableFallback(view, title, headers, rows, x, y)
+    AddTextTableFallback = False
+
+    Dim textValue
+    Dim r
+    Dim row
+    textValue = CStr(title) & vbCrLf & Join(headers, " | ")
+    For r = 0 To rows.Count - 1
+        row = rows.Item(r)
+        textValue = textValue & vbCrLf & Join(row, " | ")
+    Next
+
+    Dim txt
+    Set txt = Nothing
+    On Error Resume Next
+    Set txt = view.Texts.Add(textValue, CDbl(x), CDbl(y))
+    If Err.Number = 0 And Not txt Is Nothing Then
+        txt.Name = SafeTableName(title) & "_TEXT_FALLBACK"
+        txt.SetFontSize 0, 0, 2.5
+        AddTextTableFallback = True
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Function GetTableView(sheet)
+    Set GetTableView = Nothing
+    If sheet Is Nothing Then Exit Function
+
+    On Error Resume Next
+    Set GetTableView = sheet.Views.ActiveView
+    If Err.Number <> 0 Or GetTableView Is Nothing Then
+        Err.Clear
+        Set GetTableView = sheet.Views.Item(1)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set GetTableView = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+Function CreateOrGetSheet(doc, sheetName)
+    Set CreateOrGetSheet = Nothing
+    Dim sheets
+    Set sheets = doc.Sheets
+
+    Dim i
+    Dim sheet
+    For i = 1 To sheets.Count
+        Set sheet = sheets.Item(i)
+        If UCase(CStr(sheet.Name)) = UCase(sheetName) Then
+            sheet.Activate
+            Set CreateOrGetSheet = sheet
+            Exit Function
+        End If
+    Next
+
+    On Error Resume Next
+    Set sheet = sheets.Add(sheetName)
+    If sheet Is Nothing Then Set sheet = sheets.Add()
+    If Not sheet Is Nothing Then
+        sheet.Name = sheetName
+        sheet.Activate
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+    Set CreateOrGetSheet = sheet
+End Function
+
+' ---------------------------------------------------------------------------
+' CSV / file helpers
+' ---------------------------------------------------------------------------
+
+Function ResolveRegisterPath(doc)
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim path
+    path = ReportPath(doc, REGISTER_FILE_NAME)
+    If fso.FileExists(path) Then
+        ResolveRegisterPath = path
+        Exit Function
+    End If
+
+    path = InputBox("weld_design_register.csv was not found next to drawing." & vbCrLf & _
+                    "Enter full path to weld_design_register.csv:", MACRO_NAME, path)
+    If Trim(path) = "" Then
+        ResolveRegisterPath = ""
+    ElseIf Not fso.FileExists(path) Then
+        MsgBox "Register file not found:" & vbCrLf & path, vbExclamation, MACRO_NAME
+        ResolveRegisterPath = ""
+    Else
+        ResolveRegisterPath = path
+    End If
+End Function
+
+Function LoadRegisterCsv(filePath)
+    Dim rows
+    Set rows = NewList()
+    Set LoadRegisterCsv = rows
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(filePath) Then Exit Function
+
+    Dim ts
+    Set ts = fso.OpenTextFile(filePath, 1, False)
+    If ts.AtEndOfStream Then
+        ts.Close
+        Exit Function
+    End If
+
+    Dim headers
+    headers = ParseDelimitedLine(ts.ReadLine)
+
+    Do While Not ts.AtEndOfStream
+        Dim line
+        line = ts.ReadLine
+        If Trim(line) <> "" Then rows.Add CsvRowToDictionary(headers, ParseDelimitedLine(line))
+    Loop
+    ts.Close
+End Function
+
+Function ParseDelimitedLine(line)
+    Dim delimiter
+    If InStr(line, ";") > 0 Then
+        delimiter = ";"
+    ElseIf InStr(line, "|") > 0 Then
+        delimiter = "|"
+    Else
+        delimiter = ","
+    End If
+    ParseDelimitedLine = Split(line, delimiter)
+End Function
+
+Function CsvRowToDictionary(headers, values)
+    Dim d
+    Set d = NewDictionary()
+    Dim i
+    For i = LBound(headers) To UBound(headers)
+        If i <= UBound(values) Then
+            d.Add Trim(Unquote(CStr(headers(i)))), Trim(Unquote(CStr(values(i))))
+        Else
+            d.Add Trim(Unquote(CStr(headers(i)))), ""
+        End If
+    Next
+    Set CsvRowToDictionary = d
+End Function
+
+Function Unquote(value)
+    Dim s
+    s = CStr(value)
+    If Len(s) >= 2 Then
+        If Left(s, 1) = """" And Right(s, 1) = """" Then s = Mid(s, 2, Len(s) - 2)
+    End If
+    Unquote = Replace(s, """""", """")
+End Function
+
+' ---------------------------------------------------------------------------
+' Generic helpers
+' ---------------------------------------------------------------------------
+
+Function NewDictionary()
+    Dim d
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+    Set NewDictionary = d
+End Function
+
+Function NewList()
+    Set NewList = CreateObject("System.Collections.ArrayList")
+End Function
+
+Function DictValue(d, key)
+    If d Is Nothing Then
+        DictValue = ""
+    ElseIf d.Exists(CStr(key)) Then
+        DictValue = CStr(d.Item(CStr(key)))
+    Else
+        DictValue = ""
+    End If
+End Function
+
+Function TableRowCount(table)
+    On Error Resume Next
+    TableRowCount = CLng(table.NumberOfRows)
+    If Err.Number <> 0 Then
+        Err.Clear
+        TableRowCount = CLng(table.Rows.Count)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        TableRowCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function TableColumnCount(table)
+    On Error Resume Next
+    TableColumnCount = CLng(table.NumberOfColumns)
+    If Err.Number <> 0 Then
+        Err.Clear
+        TableColumnCount = CLng(table.Columns.Count)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        TableColumnCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function TableCell(table, rowIndex, colIndex)
+    TableCell = ""
+    On Error Resume Next
+    TableCell = CStr(table.GetCellString(CLng(rowIndex), CLng(colIndex)))
+    If Err.Number <> 0 Then
+        Err.Clear
+        TableCell = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function NormalizeHeader(value)
+    NormalizeHeader = NormalizeKey(value)
+End Function
+
+Function NormalizeKey(value)
+    Dim s
+    s = UCase(CStr(value))
+    s = Replace(s, " ", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, ChrW(268), "C")
+    s = Replace(s, ChrW(269), "C")
+    NormalizeKey = s
+End Function
+
+Function CleanMm(value)
+    Dim s
+    s = Trim(CStr(value))
+    s = Replace(UCase(s), "MM", "")
+    CleanMm = Trim(s)
+End Function
+
+Function NumberValue(value)
+    On Error Resume Next
+    Dim s
+    s = Replace(CStr(value), ",", ".")
+    NumberValue = CDbl(s)
+    If Err.Number <> 0 Then
+        Err.Clear
+        NumberValue = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function FormatNumberInvariant(value, decimals)
+    FormatNumberInvariant = Replace(CStr(Round(CDbl(value), CInt(decimals))), ",", ".")
+End Function
+
+Function ColumnWidth(header)
+    Dim h
+    h = UCase(CStr(header))
+    If InStr(h, "DODATNI") > 0 Or InStr(h, "MATERIJAL") > 0 Then
+        ColumnWidth = 45
+    ElseIf InStr(h, "DEBLJINA") > 0 Or InStr(h, "UKUPNA") > 0 Or InStr(h, "POTRO") > 0 Then
+        ColumnWidth = 28
+    ElseIf InStr(h, "WPS") > 0 Then
+        ColumnWidth = 22
+    Else
+        ColumnWidth = 18
+    End If
+End Function
+
+Function SafeTableName(title)
+    Dim s
+    s = UCase(CStr(title))
+    s = Replace(s, " ", "_")
+    s = Replace(s, "/", "_")
+    s = Replace(s, ChrW(352), "S")
+    s = Replace(s, ChrW(268), "C")
+    SafeTableName = s
+End Function
+
+Function AskYesNo(prompt, defaultYes)
+    Dim defaultValue
+    If defaultYes Then
+        defaultValue = "Yes"
+    Else
+        defaultValue = "No"
+    End If
+    Dim answer
+    answer = UCase(Trim(InputBox(prompt, MACRO_NAME, defaultValue)))
+    AskYesNo = (answer = "Y" Or answer = "YES" Or answer = "DA" Or answer = "D")
+End Function
+
+Function YesNoText(value)
+    If CBool(value) Then
+        YesNoText = "Yes"
+    Else
+        YesNoText = "No"
+    End If
+End Function
+
+Function ReportPath(doc, fileName)
+    Dim folderPath
+    folderPath = ""
+    On Error Resume Next
+    folderPath = CStr(doc.Path)
+    If Err.Number <> 0 Then
+        Err.Clear
+        folderPath = ""
+    End If
+    On Error GoTo 0
+    If folderPath = "" Then folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+    ReportPath = CreateObject("Scripting.FileSystemObject").BuildPath(folderPath, fileName)
+End Function
+
