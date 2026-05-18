@@ -1,0 +1,5654 @@
+' ---------------------------------------------------------------------------
+' GenerateWeldLabelsAndWeldTable.CATScript
+'
+' CATIA V5 CATScript macro for CATDrawing documents.
+' Source of truth is the existing model weld data stored in WELD_MAP.CATPart.
+'
+' The macro:
+'   1. reads WELD_Wxxx parameters from WELD_MAP.CATPart;
+'   2. places W001 / WELD001 welding symbols using calibrated drawing views;
+'   3. creates a selected weld table in the drawing;
+'   4. optionally creates summary tables;
+'   5. optionally exports CSV files.
+'
+' It does not create weld geometry, does not assign W001/W002 in the model and
+' does not create a welding log.
+' ---------------------------------------------------------------------------
+
+Option Explicit
+
+Const MACRO_NAME = "GenerateWeldLabelsAndWeldTable"
+Const LABEL_MIN_DISTANCE_MM = 6.0
+Const LABEL_SHIFT_MM = 5.0
+Const LABEL_MAX_SHIFT_ATTEMPTS = 10
+Const DEFAULT_TEXT_HEIGHT_MM = 3.5
+Const CALIBRATION_FILE_NAME = "drawing_weld_view_calibration.csv"
+
+Sub CATMain()
+    Dim catiaApp
+    Set catiaApp = CATIA
+
+    Dim drawingDoc
+    On Error Resume Next
+    Set drawingDoc = catiaApp.ActiveDocument
+    On Error GoTo 0
+
+    If drawingDoc Is Nothing Then
+        MsgBox "Open CATDrawing and run this macro again.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    If TypeName(drawingDoc) <> "DrawingDocument" Then
+        MsgBox "Open CATDrawing and run this macro again.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim linkedModelDoc
+    Set linkedModelDoc = FindLinkedModelDocument(drawingDoc)
+
+    If linkedModelDoc Is Nothing Then
+        Set linkedModelDoc = FindOpenModelDocument()
+    End If
+
+    If linkedModelDoc Is Nothing Then
+        MsgBox "Could not find linked CATProduct/CATPart." & vbCrLf & _
+               "Please open the model and drawing in CATIA, then run macro again.", _
+               vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim weldMapDoc
+    Set weldMapDoc = FindWeldMapDocument(linkedModelDoc)
+
+    If weldMapDoc Is Nothing Then
+        MsgBox "WELD_MAP CATPart not found." & vbCrLf & _
+               "Open the CATProduct containing WELD_MAP and run macro again.", _
+               vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim activeSheet
+    Set activeSheet = drawingDoc.Sheets.ActiveSheet
+
+    Dim macroMode
+    macroMode = AskString("Select macro mode:" & vbCrLf & _
+                          "1 = Generate using automatic calibration if possible" & vbCrLf & _
+                          "2 = CalibrateDrawingView manually" & vbCrLf & _
+                          "3 = Generate using saved calibration", "1")
+
+    If IsCalibrationMode(macroMode) Then
+        Call CalibrateDrawingView(drawingDoc, activeSheet, linkedModelDoc, weldMapDoc)
+        Exit Sub
+    End If
+
+    Dim welds
+    Set welds = LoadWeldsFromWeldMap(weldMapDoc)
+
+    If welds.Count = 0 Then
+        MsgBox "No WELD_Wxxx data found. Run model WeldMap macro first.", _
+               vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim sortedKeys
+    sortedKeys = SortedWeldKeys(welds)
+
+    Dim viewCalibrations
+    Dim calibrationMethodUsed
+    Dim calibrationSetupMessage
+    Set viewCalibrations = ResolveCalibrationsForGeneration(drawingDoc, activeSheet, macroMode, _
+                                                            calibrationMethodUsed, calibrationSetupMessage)
+
+    Dim labelChoice
+    labelChoice = AskString("Label format:" & vbCrLf & _
+                            "1 = W001" & vbCrLf & _
+                            "2 = WELD001", "1")
+    If Trim(labelChoice) = "" Then labelChoice = "1"
+
+    Dim unplacedLabels
+    Set unplacedLabels = NewList()
+
+    Dim labelDebugLines
+    Set labelDebugLines = NewList()
+    ListAdd labelDebugLines, "View calibrations loaded: " & CStr(viewCalibrations.Count)
+    ListAdd labelDebugLines, "Calibration method used: " & calibrationMethodUsed
+    If Trim(calibrationSetupMessage) <> "" Then ListAdd labelDebugLines, "Calibration setup: " & calibrationSetupMessage
+
+    Dim placedCount
+    Dim textFallbackCount
+    Dim overlapWarningCount
+    Dim modelGeometryFoundCount
+    Dim projectedGeometryFoundCount
+    Dim labelPointCalculatedCount
+    Dim projectionFailedCount
+    Dim placed3DProjectionCount
+    Dim placedModelFallbackCount
+    Dim placed2DProjectionCount
+    Dim fallbackLayoutCount
+    placedCount = 0
+    textFallbackCount = 0
+    overlapWarningCount = 0
+    modelGeometryFoundCount = 0
+    projectedGeometryFoundCount = 0
+    labelPointCalculatedCount = 0
+    projectionFailedCount = 0
+    placed3DProjectionCount = 0
+    placedModelFallbackCount = 0
+    placed2DProjectionCount = 0
+    fallbackLayoutCount = 0
+
+    Call PlaceWeldLabels(drawingDoc, activeSheet, weldMapDoc, viewCalibrations, welds, sortedKeys, _
+                         labelChoice, placedCount, overlapWarningCount, unplacedLabels, _
+                         textFallbackCount, _
+                         labelDebugLines, modelGeometryFoundCount, projectedGeometryFoundCount, _
+                         labelPointCalculatedCount, projectionFailedCount, _
+                         placed3DProjectionCount, placedModelFallbackCount, placed2DProjectionCount)
+
+    Dim bomMaps
+    Set bomMaps = BuildBomMapsFromDrawing(activeSheet)
+    ListAdd labelDebugLines, "BOM part numbers mapped: " & _
+                             CStr(bomMaps.Item("PositionByPartNumber").Count)
+
+    Dim tableHeaders
+    Dim tableRows
+    tableHeaders = SimpleWeldJointHeaders()
+    Set tableRows = BuildSimpleWeldJointRows(welds, sortedKeys, bomMaps, linkedModelDoc)
+
+    Dim consumptionHeaders
+    Dim consumptionRows
+    consumptionHeaders = MaterialConsumptionHeaders()
+    Set consumptionRows = BuildMaterialConsumptionRowsWithSummary(welds, sortedKeys)
+
+    Dim tableCreated
+    Dim consumptionTableCreated
+    tableCreated = False
+    consumptionTableCreated = False
+
+    Dim tableSheet
+    Set tableSheet = activeSheet
+
+    Dim tableX
+    Dim tableY
+    tableX = 20.0
+    tableY = DefaultTableTopY(activeSheet, 250.0)
+
+    Dim createOnActive
+    Dim activeSheetTooSmall
+    activeSheetTooSmall = Not TablesFitOnSheet(activeSheet, tableHeaders, tableRows, _
+                                                consumptionHeaders, consumptionRows, tableX, tableY)
+
+    If activeSheetTooSmall Then
+        If AskYesNo("Tables may not fit on active sheet." & vbCrLf & _
+                    "Create tables on separate sheet? Yes/No", True) Then
+            Set tableSheet = CreateOrGetSheet(drawingDoc, "WELD_TABLE")
+            tableY = DefaultTableTopY(tableSheet, 250.0)
+        Else
+            Set tableSheet = activeSheet
+        End If
+    Else
+        createOnActive = AskYesNo("Create weld tables on active sheet? Yes/No", True)
+
+        If createOnActive Then
+            Set tableSheet = activeSheet
+        ElseIf AskYesNo("Create tables on separate sheet? Yes/No", True) Then
+            Set tableSheet = CreateOrGetSheet(drawingDoc, "WELD_TABLE")
+            tableY = DefaultTableTopY(tableSheet, 250.0)
+        Else
+            Set tableSheet = Nothing
+        End If
+    End If
+
+    If Not tableSheet Is Nothing Then
+        tableX = AskNumber("Enter table X position:", tableX)
+        tableY = AskNumber("Enter table Y position:", tableY)
+        tableCreated = AddDrawingTable(tableSheet, WeldJointTableTitle(), tableHeaders, tableRows, tableX, tableY)
+
+        Dim consumptionY
+        consumptionY = tableY - TableBlockHeight(tableRows) - 10.0
+        If consumptionY < 20.0 Then consumptionY = 20.0
+
+        consumptionTableCreated = AddDrawingTable(tableSheet, MaterialConsumptionTableTitle(), _
+                                                  consumptionHeaders, consumptionRows, tableX, consumptionY)
+    End If
+
+    If Not tableCreated Or Not consumptionTableCreated Then
+        MsgBox "Weld data loaded, but one or more drawing tables could not be created.", _
+               vbExclamation, MACRO_NAME
+    End If
+
+    If AskYesNo("Export CSV files? Yes/No", False) Then
+        Call ExportCsvFiles(drawingDoc, tableHeaders, tableRows, consumptionHeaders, consumptionRows)
+    End If
+
+    Dim unplacedReviewTableCreated
+    unplacedReviewTableCreated = False
+
+    If unplacedLabels.Count > 0 Then
+        unplacedReviewTableCreated = AddUnplacedLabelsTable(activeSheet, unplacedLabels)
+    End If
+
+    Dim fallbackPlacedCount
+    fallbackPlacedCount = placedModelFallbackCount + placed2DProjectionCount + fallbackLayoutCount
+
+    ListAdd labelDebugLines, "Calibration method used: " & calibrationMethodUsed
+    ListAdd labelDebugLines, "Welding symbols placed: " & CStr(placed3DProjectionCount)
+    ListAdd labelDebugLines, "Welding symbols placed with fallback: " & CStr(fallbackPlacedCount)
+    ListAdd labelDebugLines, "Unplaced weld symbols: " & CStr(unplacedLabels.Count)
+
+    Dim debugLogPath
+    debugLogPath = WriteLabelDebugLog(drawingDoc, labelDebugLines)
+
+    Dim finalMsg
+    finalMsg = "Drawing weld map completed." & vbCrLf & vbCrLf & _
+               "Calibration method used: " & calibrationMethodUsed & vbCrLf & _
+               "Welding symbols placed: " & CStr(placed3DProjectionCount) & vbCrLf & _
+               "Unplaced symbols: " & CStr(unplacedLabels.Count) & vbCrLf & _
+               "TABELA ZAVARENIH SPOJEVA created: " & YesNoText(tableCreated) & vbCrLf & _
+               MaterialConsumptionTableTitle() & " created: " & YesNoText(consumptionTableCreated)
+
+    If Trim(calibrationSetupMessage) <> "" Then
+        finalMsg = finalMsg & vbCrLf & calibrationSetupMessage
+    End If
+
+    If overlapWarningCount > 0 Then
+        finalMsg = finalMsg & vbCrLf & _
+                   "Automatic label placement warning: " & CStr(overlapWarningCount) & _
+                   " label(s) remained close to another label."
+    End If
+
+    If textFallbackCount > 0 Then
+        finalMsg = finalMsg & vbCrLf & _
+                   "Welding Symbol API not available. Labels were placed as text fallback: " & CStr(textFallbackCount)
+    End If
+
+    If placedCount = 0 Then
+        finalMsg = finalMsg & vbCrLf & vbCrLf & _
+                   "No welding symbols were placed." & vbCrLf & _
+                   "Automatic view calibration failed or no valid transform was available." & vbCrLf & _
+                   "Please run CalibrateDrawingView." & vbCrLf & _
+                   LabelPlacementFailureReason(modelGeometryFoundCount, projectedGeometryFoundCount, _
+                                               labelPointCalculatedCount, projectionFailedCount)
+    End If
+
+    If unplacedLabels.Count > 0 And placed3DProjectionCount = 0 Then
+        finalMsg = finalMsg & vbCrLf & vbCrLf & _
+                   "Calibrated view transform was not available for these welds." & vbCrLf & _
+                   "Automatic view calibration failed. Please run CalibrateDrawingView."
+    End If
+
+    If unplacedLabels.Count > 0 Then
+        finalMsg = finalMsg & vbCrLf & vbCrLf & "Unplaced weld symbols:" & vbCrLf & _
+                   ListToMultilineText(unplacedLabels)
+        finalMsg = finalMsg & vbCrLf & _
+                   "Automatic welding symbol placement failed for some welds. See UnplacedLabels list."
+    End If
+
+    If unplacedReviewTableCreated Then
+        finalMsg = finalMsg & vbCrLf & "Unplaced weld symbols review table created: Yes"
+    End If
+
+    If debugLogPath <> "" Then
+        finalMsg = finalMsg & vbCrLf & "Label debug log: " & debugLogPath
+    End If
+
+    MsgBox finalMsg, vbInformation, MACRO_NAME
+End Sub
+
+' ---------------------------------------------------------------------------
+' Document and WELD_MAP discovery
+' ---------------------------------------------------------------------------
+
+Function FindLinkedModelDocument(drawingDoc)
+    Set FindLinkedModelDocument = Nothing
+
+    Dim sheets
+    Dim sheet
+    Dim views
+    Dim view
+    Dim gb
+    Dim linked
+    Dim resolved
+    Dim i
+    Dim j
+
+    On Error Resume Next
+    Set sheets = drawingDoc.Sheets
+    On Error GoTo 0
+
+    If sheets Is Nothing Then Exit Function
+
+    For i = 1 To sheets.Count
+        On Error Resume Next
+        Set sheet = sheets.Item(i)
+        Set views = sheet.Views
+        On Error GoTo 0
+
+        If Not views Is Nothing Then
+            For j = 1 To views.Count
+                Set view = Nothing
+                Set gb = Nothing
+                Set linked = Nothing
+                Set resolved = Nothing
+
+                On Error Resume Next
+                Set view = views.Item(j)
+                Set gb = view.GenerativeBehavior
+                Set linked = gb.Document
+                On Error GoTo 0
+
+                If Not linked Is Nothing Then
+                    Set resolved = ResolveModelObjectToDocument(linked)
+                    If Not resolved Is Nothing Then
+                        Set FindLinkedModelDocument = resolved
+                        Exit Function
+                    End If
+                End If
+            Next
+        End If
+    Next
+End Function
+
+Function FindOpenModelDocument()
+    Set FindOpenModelDocument = Nothing
+
+    Dim docs
+    Dim doc
+    Dim i
+
+    On Error Resume Next
+    Set docs = CATIA.Documents
+    On Error GoTo 0
+
+    If docs Is Nothing Then Exit Function
+
+    For i = 1 To docs.Count
+        Set doc = Nothing
+        On Error Resume Next
+        Set doc = docs.Item(i)
+        On Error GoTo 0
+
+        If IsProductDocument(doc) Then
+            Set FindOpenModelDocument = doc
+            Exit Function
+        End If
+    Next
+
+    For i = 1 To docs.Count
+        Set doc = Nothing
+        On Error Resume Next
+        Set doc = docs.Item(i)
+        On Error GoTo 0
+
+        If IsPartDocument(doc) Then
+            Set FindOpenModelDocument = doc
+            Exit Function
+        End If
+    Next
+End Function
+
+Function FindWeldMapDocument(modelDoc)
+    Set FindWeldMapDocument = Nothing
+
+    Dim found
+    Set found = Nothing
+
+    If Not modelDoc Is Nothing Then
+        If IsPartDocument(modelDoc) Then
+            If IsWeldMapName(modelDoc.Name) Then
+                Set FindWeldMapDocument = modelDoc
+                Exit Function
+            End If
+        End If
+
+        If IsProductDocument(modelDoc) Then
+            Set found = SearchProductForWeldMap(modelDoc.Product)
+            If Not found Is Nothing Then
+                Set FindWeldMapDocument = found
+                Exit Function
+            End If
+        End If
+    End If
+
+    Set found = FindOpenWeldMapDocument()
+    If Not found Is Nothing Then Set FindWeldMapDocument = found
+End Function
+
+Function FindOpenWeldMapDocument()
+    Set FindOpenWeldMapDocument = Nothing
+
+    Dim docs
+    Dim doc
+    Dim i
+    Dim found
+
+    On Error Resume Next
+    Set docs = CATIA.Documents
+    On Error GoTo 0
+
+    If docs Is Nothing Then Exit Function
+
+    For i = 1 To docs.Count
+        Set doc = Nothing
+        On Error Resume Next
+        Set doc = docs.Item(i)
+        On Error GoTo 0
+
+        If IsPartDocument(doc) Then
+            If IsWeldMapName(doc.Name) Then
+                Set FindOpenWeldMapDocument = doc
+                Exit Function
+            End If
+        End If
+    Next
+
+    For i = 1 To docs.Count
+        Set doc = Nothing
+        On Error Resume Next
+        Set doc = docs.Item(i)
+        On Error GoTo 0
+
+        If IsProductDocument(doc) Then
+            Set found = SearchProductForWeldMap(doc.Product)
+            If Not found Is Nothing Then
+                Set FindOpenWeldMapDocument = found
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Function SearchProductForWeldMap(product)
+    Set SearchProductForWeldMap = Nothing
+
+    If product Is Nothing Then Exit Function
+
+    Dim doc
+    Set doc = Nothing
+
+    If ProductLooksLikeWeldMap(product) Then
+        Set doc = ProductToDocument(product)
+        If Not doc Is Nothing Then
+            If IsPartDocument(doc) Then
+                Set SearchProductForWeldMap = doc
+                Exit Function
+            End If
+        End If
+    End If
+
+    Dim children
+    Dim child
+    Dim i
+    Dim found
+
+    On Error Resume Next
+    Set children = product.Products
+    On Error GoTo 0
+
+    If children Is Nothing Then Exit Function
+
+    For i = 1 To children.Count
+        Set child = Nothing
+        Set found = Nothing
+
+        On Error Resume Next
+        Set child = children.Item(i)
+        On Error GoTo 0
+
+        If Not child Is Nothing Then
+            Set found = SearchProductForWeldMap(child)
+            If Not found Is Nothing Then
+                Set SearchProductForWeldMap = found
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Function ResolveModelObjectToDocument(modelObject)
+    Set ResolveModelObjectToDocument = Nothing
+
+    If modelObject Is Nothing Then Exit Function
+
+    If IsPartDocument(modelObject) Or IsProductDocument(modelObject) Then
+        Set ResolveModelObjectToDocument = modelObject
+        Exit Function
+    End If
+
+    If TypeName(modelObject) = "Product" Then
+        Set ResolveModelObjectToDocument = ProductToDocument(modelObject)
+        Exit Function
+    End If
+
+    If TypeName(modelObject) = "Part" Then
+        Dim parentDoc
+        Set parentDoc = Nothing
+        On Error Resume Next
+        Set parentDoc = modelObject.Parent
+        On Error GoTo 0
+
+        If IsPartDocument(parentDoc) Then Set ResolveModelObjectToDocument = parentDoc
+        Exit Function
+    End If
+End Function
+
+Function ProductToDocument(product)
+    Set ProductToDocument = Nothing
+
+    Dim doc
+    Set doc = Nothing
+
+    On Error Resume Next
+    Set doc = product.ReferenceProduct.Parent
+    On Error GoTo 0
+
+    If IsPartDocument(doc) Or IsProductDocument(doc) Then
+        Set ProductToDocument = doc
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set doc = product.Parent.Parent
+    On Error GoTo 0
+
+    If IsPartDocument(doc) Or IsProductDocument(doc) Then Set ProductToDocument = doc
+End Function
+
+Function IsPartDocument(doc)
+    IsPartDocument = False
+    If doc Is Nothing Then Exit Function
+    If TypeName(doc) = "PartDocument" Then IsPartDocument = True
+End Function
+
+Function IsProductDocument(doc)
+    IsProductDocument = False
+    If doc Is Nothing Then Exit Function
+    If TypeName(doc) = "ProductDocument" Then IsProductDocument = True
+End Function
+
+Function ProductLooksLikeWeldMap(product)
+    ProductLooksLikeWeldMap = False
+    If product Is Nothing Then Exit Function
+
+    Dim nameValue
+    Dim partNumberValue
+
+    nameValue = ""
+    partNumberValue = ""
+
+    On Error Resume Next
+    nameValue = CStr(product.Name)
+    partNumberValue = CStr(product.PartNumber)
+    On Error GoTo 0
+
+    If InStr(NormalizeName(nameValue), "WELDMAP") > 0 Or _
+       InStr(NormalizeName(partNumberValue), "WELDMAP") > 0 Then
+        ProductLooksLikeWeldMap = True
+    End If
+End Function
+
+Function IsWeldMapName(value)
+    IsWeldMapName = (InStr(NormalizeName(value), "WELDMAP") > 0)
+End Function
+
+Function NormalizeName(value)
+    Dim s
+    s = UCase(CStr(value))
+    s = Replace(s, " ", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "-", "")
+    NormalizeName = s
+End Function
+
+' ---------------------------------------------------------------------------
+' Weld data loading
+' ---------------------------------------------------------------------------
+
+Function LoadWeldsFromWeldMap(weldMapDoc)
+    Dim welds
+    Set welds = CreateObject("Scripting.Dictionary")
+    welds.CompareMode = 1
+
+    Set LoadWeldsFromWeldMap = welds
+
+    Dim params
+    Set params = Nothing
+
+    On Error Resume Next
+    Set params = weldMapDoc.Part.Parameters
+    On Error GoTo 0
+
+    If params Is Nothing Then Exit Function
+
+    Dim prefixes
+    Dim index
+    Set prefixes = CreateObject("Scripting.Dictionary")
+    prefixes.CompareMode = 1
+
+    Set index = BuildParameterIndex(params, prefixes)
+
+    If prefixes.Count = 0 Then Exit Function
+
+    Dim prefix
+    Dim fieldNames
+    Dim fieldName
+    Dim w
+    Dim weldId
+    Dim key
+
+    fieldNames = AllParameterFields()
+
+    For Each prefix In prefixes.Keys
+        Set w = CreateObject("Scripting.Dictionary")
+        w.CompareMode = 1
+
+        w.Add "_Prefix", CStr(prefix)
+
+        For Each fieldName In fieldNames
+            w.Add CStr(fieldName), GetParameterValue(index, CStr(prefix) & "_" & CStr(fieldName))
+        Next
+
+        weldId = Trim(GetDictString(w, "WeldID"))
+        If weldId = "" Then weldId = PrefixToWeldId(CStr(prefix))
+        weldId = NormalizeWeldId(weldId)
+
+        If weldId = "" Then weldId = PrefixToWeldId(CStr(prefix))
+        If weldId = "" Then weldId = CStr(prefix)
+
+        SetDictString w, "WeldID", weldId
+
+        key = weldId
+        If welds.Exists(key) Then key = CStr(prefix)
+
+        welds.Add key, w
+    Next
+End Function
+
+Function BuildParameterIndex(params, prefixes)
+    Dim index
+    Set index = CreateObject("Scripting.Dictionary")
+    index.CompareMode = 1
+
+    Dim i
+    Dim p
+    Dim nameValue
+    Dim baseName
+    Dim upperName
+    Dim prefix
+
+    For i = 1 To params.Count
+        Set p = Nothing
+        nameValue = ""
+        baseName = ""
+        upperName = ""
+
+        On Error Resume Next
+        Set p = params.Item(i)
+        nameValue = CStr(p.Name)
+        On Error GoTo 0
+
+        If Not p Is Nothing Then
+            baseName = LastNamePart(nameValue)
+            upperName = UCase(baseName)
+
+            If Not index.Exists(upperName) Then
+                index.Add upperName, ParameterToString(p)
+            End If
+
+            prefix = ExtractWeldPrefix(upperName)
+            If prefix <> "" Then
+                If Not prefixes.Exists(prefix) Then prefixes.Add prefix, prefix
+            End If
+        End If
+    Next
+
+    Set BuildParameterIndex = index
+End Function
+
+Function AllParameterFields()
+    AllParameterFields = Array( _
+        "WeldID", _
+        "PartA_Number", _
+        "PartA_Name", _
+        "PartA_Material", _
+        "PartA_Thickness", _
+        "PartA_Dimension", _
+        "PartB_Number", _
+        "PartB_Name", _
+        "PartB_Material", _
+        "PartB_Thickness", _
+        "PartB_Dimension", _
+        "WeldType", _
+        "WeldSize", _
+        "GrooveDepth", _
+        "GrooveAngle", _
+        "RootGap_mm", _
+        "RootFace_mm", _
+        "NumberOfPasses", _
+        "WeldLength_mm", _
+        "WeldLength_m", _
+        "WPS", _
+        "WeldingProcess", _
+        "FillerType", _
+        "FillerTradeName", _
+        "FillerDesignation", _
+        "FillerDiameter", _
+        "EstimatedFillerConsumption_kg", _
+        "EstimatedGasBottles_200bar", _
+        "GasBottleVolume_L", _
+        "GasBottlePressure_bar", _
+        "GasPerBottle_L", _
+        "GasPerKgFiller_L", _
+        "EstimatedGasLiters", _
+        "EstimatedGasBottles_40L_200bar", _
+        "AnchorName", _
+        "PreferredView", _
+        "VT", _
+        "PT", _
+        "UT", _
+        "Remark", _
+        "LabelPointX", _
+        "LabelPointY", _
+        "LabelPointZ")
+End Function
+
+Function GetParameterValue(index, parameterName)
+    Dim key
+    Dim existing
+
+    key = UCase(CStr(parameterName))
+    GetParameterValue = ""
+
+    If index.Exists(key) Then
+        GetParameterValue = CStr(index.Item(key))
+        Exit Function
+    End If
+
+    For Each existing In index.Keys
+        If Right(CStr(existing), Len(key)) = key Then
+            GetParameterValue = CStr(index.Item(existing))
+            Exit Function
+        End If
+    Next
+End Function
+
+Function ParameterToString(parameter)
+    Dim s
+    s = ""
+
+    On Error Resume Next
+    Err.Clear
+    s = CStr(parameter.ValueAsString)
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = CStr(parameter.Value)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = ""
+    End If
+    On Error GoTo 0
+
+    ParameterToString = s
+End Function
+
+Function LastNamePart(value)
+    Dim s
+    Dim parts
+    s = CStr(value)
+
+    If InStr(s, "\") > 0 Then
+        parts = Split(s, "\")
+        s = CStr(parts(UBound(parts)))
+    End If
+
+    LastNamePart = s
+End Function
+
+Function ExtractWeldPrefix(value)
+    Dim re
+    Dim matches
+
+    ExtractWeldPrefix = ""
+    Set re = CreateObject("VBScript.RegExp")
+    re.IgnoreCase = True
+    re.Global = False
+    re.Pattern = "WELD_W[0-9]+"
+
+    Set matches = re.Execute(CStr(value))
+    If matches.Count > 0 Then ExtractWeldPrefix = UCase(matches.Item(0).Value)
+End Function
+
+Function PrefixToWeldId(prefix)
+    PrefixToWeldId = NormalizeWeldId(Replace(UCase(CStr(prefix)), "WELD_", ""))
+End Function
+
+Function NormalizeWeldId(value)
+    Dim s
+    Dim re
+    Dim matches
+    Dim n
+
+    NormalizeWeldId = ""
+    s = UCase(Trim(CStr(value)))
+    s = Replace(s, "WELD_", "")
+    s = Replace(s, "WELD", "W")
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.IgnoreCase = True
+    re.Global = False
+    re.Pattern = "([0-9]+)"
+
+    Set matches = re.Execute(s)
+    If matches.Count > 0 Then
+        n = CLng(matches.Item(0).SubMatches(0))
+        NormalizeWeldId = "W" & PadLeft(CStr(n), 3, "0")
+    End If
+End Function
+
+Function SortedWeldKeys(welds)
+    Dim keys
+    Dim i
+    Dim j
+    Dim temp
+
+    keys = welds.Keys
+
+    If welds.Count <= 1 Then
+        SortedWeldKeys = keys
+        Exit Function
+    End If
+
+    For i = LBound(keys) To UBound(keys) - 1
+        For j = i + 1 To UBound(keys)
+            If WeldSortNumber(CStr(keys(i))) > WeldSortNumber(CStr(keys(j))) Then
+                temp = keys(i)
+                keys(i) = keys(j)
+                keys(j) = temp
+            End If
+        Next
+    Next
+
+    SortedWeldKeys = keys
+End Function
+
+Function WeldSortNumber(weldId)
+    Dim re
+    Dim matches
+    Set re = CreateObject("VBScript.RegExp")
+    re.IgnoreCase = True
+    re.Global = False
+    re.Pattern = "([0-9]+)"
+
+    Set matches = re.Execute(CStr(weldId))
+    If matches.Count > 0 Then
+        WeldSortNumber = CLng(matches.Item(0).SubMatches(0))
+    Else
+        WeldSortNumber = 999999999
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' View calibration
+' ---------------------------------------------------------------------------
+
+Function IsCalibrationMode(modeValue)
+    Dim s
+    s = UCase(Trim(CStr(modeValue)))
+    IsCalibrationMode = (s = "2" Or s = "CALIBRATEDRAWINGVIEW" Or _
+                         s = "CALIBRATE" Or InStr(s, "CALIB") > 0)
+End Function
+
+Function IsSavedCalibrationMode(modeValue)
+    Dim s
+    s = UCase(Trim(CStr(modeValue)))
+    IsSavedCalibrationMode = (s = "3" Or s = "SAVED" Or InStr(s, "CSV") > 0)
+End Function
+
+Function ResolveCalibrationsForGeneration(drawingDoc, sheet, macroMode, ByRef methodUsed, ByRef message)
+    Dim calibrations
+    Set calibrations = CreateObject("Scripting.Dictionary")
+    calibrations.CompareMode = 1
+
+    methodUsed = "Manual required"
+    message = ""
+
+    Dim saved
+    Set saved = LoadViewCalibrations(drawingDoc, False)
+
+    If IsSavedCalibrationMode(macroMode) Then
+        If saved.Count > 0 Then
+            methodUsed = "Saved CSV"
+            message = "Saved calibration loaded from " & CalibrationFilePath(drawingDoc, False)
+            Set ResolveCalibrationsForGeneration = saved
+            Exit Function
+        End If
+
+        message = "Saved calibration was requested, but drawing_weld_view_calibration.csv was not found. Please run CalibrateDrawingView."
+        Set ResolveCalibrationsForGeneration = calibrations
+        Exit Function
+    End If
+
+    Dim useSavedFirst
+    useSavedFirst = False
+
+    If saved.Count > 0 Then
+        useSavedFirst = AskYesNo("Saved calibration found. Use it? Yes/No", False)
+        If useSavedFirst Then
+            methodUsed = "Saved CSV"
+            message = "Saved calibration loaded from " & CalibrationFilePath(drawingDoc, False)
+            Set ResolveCalibrationsForGeneration = saved
+            Exit Function
+        End If
+    End If
+
+    Dim autoMessage
+    Set calibrations = BuildAutomaticViewCalibrations(sheet, autoMessage)
+
+    If Not calibrations Is Nothing Then
+        If calibrations.Count > 0 Then
+            methodUsed = "Automatic"
+            message = autoMessage
+            Set ResolveCalibrationsForGeneration = calibrations
+            Exit Function
+        End If
+    End If
+
+    If saved.Count > 0 Then
+        If AskYesNo("Automatic view calibration failed." & vbCrLf & _
+                    "Use saved CSV calibration? Yes/No", True) Then
+            methodUsed = "Saved CSV"
+            message = "Automatic view calibration failed. Saved calibration loaded from " & _
+                      CalibrationFilePath(drawingDoc, False)
+            Set ResolveCalibrationsForGeneration = saved
+            Exit Function
+        End If
+    End If
+
+    methodUsed = "Manual required"
+    If Trim(autoMessage) <> "" Then
+        message = "Automatic view calibration failed. " & autoMessage & " Please run CalibrateDrawingView."
+    Else
+        message = "Automatic view calibration failed. Please run CalibrateDrawingView."
+    End If
+
+    Dim emptyCalibrations
+    Set emptyCalibrations = CreateObject("Scripting.Dictionary")
+    emptyCalibrations.CompareMode = 1
+    Set ResolveCalibrationsForGeneration = emptyCalibrations
+End Function
+
+Function BuildAutomaticViewCalibrations(sheet, ByRef message)
+    Dim calibrations
+    Set calibrations = CreateObject("Scripting.Dictionary")
+    calibrations.CompareMode = 1
+
+    message = ""
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then
+        message = "No DrawingView collection found on active sheet."
+        Set BuildAutomaticViewCalibrations = calibrations
+        Exit Function
+    End If
+
+    Dim i
+    Dim view
+    Dim rec
+    Dim failCount
+
+    failCount = 0
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                Set rec = BuildAutomaticViewCalibration(view)
+
+                If Not rec Is Nothing Then
+                    If Not calibrations.Exists(GetDictString(rec, "ViewKey")) Then
+                        calibrations.Add GetDictString(rec, "ViewKey"), rec
+                    Else
+                        Set calibrations.Item(GetDictString(rec, "ViewKey")) = rec
+                    End If
+                Else
+                    failCount = failCount + 1
+                End If
+            End If
+        End If
+    Next
+
+    If calibrations.Count > 0 Then
+        message = "Automatic DrawingView transform built for " & CStr(calibrations.Count) & " view(s)."
+    Else
+        message = "CATIA generative view transform data was not available."
+    End If
+
+    Set BuildAutomaticViewCalibrations = calibrations
+End Function
+
+Function BuildAutomaticViewCalibration(view)
+    Set BuildAutomaticViewCalibration = Nothing
+
+    Dim gb
+    Set gb = Nothing
+
+    On Error Resume Next
+    Set gb = view.GenerativeBehavior
+    On Error GoTo 0
+
+    If gb Is Nothing Then Exit Function
+
+    Dim origin(2)
+    Dim axisH(2)
+    Dim axisV(2)
+
+    If Not TryGetViewProjectionPlane(gb, origin, axisH, axisV) Then Exit Function
+    If Not AxesLookUsable(axisH, axisV) Then Exit Function
+
+    Dim scaleValue
+    scaleValue = GetViewScale(view)
+    If CDbl(scaleValue) = 0.0 Then Exit Function
+
+    Dim viewOriginX
+    Dim viewOriginY
+    Dim viewOriginSource
+    Call GetView2DOrigin(view, viewOriginX, viewOriginY, viewOriginSource)
+
+    Dim rec
+    Set rec = CreateObject("Scripting.Dictionary")
+    rec.CompareMode = 1
+
+    SetDictString rec, "ViewKey", CalibrationViewKey(ObjectName(view))
+    SetDictString rec, "ViewName", ObjectName(view)
+    SetDictString rec, "Source", "Automatic"
+
+    SetDictString rec, "M11", CStr(CDbl(axisH(0)) * CDbl(scaleValue))
+    SetDictString rec, "M12", CStr(CDbl(axisH(1)) * CDbl(scaleValue))
+    SetDictString rec, "M13", CStr(CDbl(axisH(2)) * CDbl(scaleValue))
+    SetDictString rec, "M14", CStr(CDbl(viewOriginX) + _
+                                  ((0.0 - Dot3(axisH(0), axisH(1), axisH(2), origin(0), origin(1), origin(2))) * CDbl(scaleValue)))
+
+    SetDictString rec, "M21", CStr(CDbl(axisV(0)) * CDbl(scaleValue))
+    SetDictString rec, "M22", CStr(CDbl(axisV(1)) * CDbl(scaleValue))
+    SetDictString rec, "M23", CStr(CDbl(axisV(2)) * CDbl(scaleValue))
+    SetDictString rec, "M24", CStr(CDbl(viewOriginY) + _
+                                  ((0.0 - Dot3(axisV(0), axisV(1), axisV(2), origin(0), origin(1), origin(2))) * CDbl(scaleValue)))
+
+    SetDictString rec, "ViewOriginX", CStr(viewOriginX)
+    SetDictString rec, "ViewOriginY", CStr(viewOriginY)
+    SetDictString rec, "ViewOriginSource", viewOriginSource
+
+    SetDictString rec, "A3X", CStr(origin(0))
+    SetDictString rec, "A3Y", CStr(origin(1))
+    SetDictString rec, "A3Z", CStr(origin(2))
+    SetDictString rec, "A2X", CStr(viewOriginX)
+    SetDictString rec, "A2Y", CStr(viewOriginY)
+
+    SetDictString rec, "B3X", CStr(CDbl(origin(0)) + CDbl(axisH(0)))
+    SetDictString rec, "B3Y", CStr(CDbl(origin(1)) + CDbl(axisH(1)))
+    SetDictString rec, "B3Z", CStr(CDbl(origin(2)) + CDbl(axisH(2)))
+    SetDictString rec, "B2X", CStr(CDbl(viewOriginX) + CDbl(scaleValue))
+    SetDictString rec, "B2Y", CStr(viewOriginY)
+
+    SetDictString rec, "C3X", CStr(CDbl(origin(0)) + CDbl(axisV(0)))
+    SetDictString rec, "C3Y", CStr(CDbl(origin(1)) + CDbl(axisV(1)))
+    SetDictString rec, "C3Z", CStr(CDbl(origin(2)) + CDbl(axisV(2)))
+    SetDictString rec, "C2X", CStr(viewOriginX)
+    SetDictString rec, "C2Y", CStr(CDbl(viewOriginY) + CDbl(scaleValue))
+
+    Set BuildAutomaticViewCalibration = rec
+End Function
+
+Function TryGetViewProjectionPlane(generativeBehavior, ByRef origin, ByRef axisH, ByRef axisV)
+    TryGetViewProjectionPlane = False
+
+    On Error Resume Next
+    Err.Clear
+    generativeBehavior.GetProjectionPlane origin, axisH, axisV
+    If Err.Number = 0 Then
+        TryGetViewProjectionPlane = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    generativeBehavior.GetProjectionPlaneAxis origin, axisH, axisV
+    If Err.Number = 0 Then
+        TryGetViewProjectionPlane = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    generativeBehavior.GetProjectionPlaneData origin, axisH, axisV
+    If Err.Number = 0 Then TryGetViewProjectionPlane = True
+
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Sub GetView2DOrigin(view, ByRef originX, ByRef originY, ByRef source)
+    originX = 0.0
+    originY = 0.0
+    source = "Default 0,0"
+
+    On Error Resume Next
+    Err.Clear
+    originX = CDbl(view.xAxisData)
+    originY = CDbl(view.yAxisData)
+    If Err.Number = 0 Then
+        source = "DrawingView xAxisData/yAxisData"
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    Err.Clear
+    originX = CDbl(view.X)
+    originY = CDbl(view.Y)
+    If Err.Number = 0 Then
+        source = "DrawingView X/Y"
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    Err.Clear
+    view.GetViewPosition originX, originY
+    If Err.Number = 0 Then
+        source = "DrawingView GetViewPosition"
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    Err.Clear
+    originX = 0.0
+    originY = 0.0
+    source = "Default 0,0"
+    On Error GoTo 0
+End Sub
+
+Function AxesLookUsable(axisH, axisV)
+    AxesLookUsable = False
+
+    Dim lenH
+    Dim lenV
+    lenH = Sqr(Dot3(axisH(0), axisH(1), axisH(2), axisH(0), axisH(1), axisH(2)))
+    lenV = Sqr(Dot3(axisV(0), axisV(1), axisV(2), axisV(0), axisV(1), axisV(2)))
+
+    If CDbl(lenH) < 0.000001 Then Exit Function
+    If CDbl(lenV) < 0.000001 Then Exit Function
+
+    AxesLookUsable = True
+End Function
+
+Sub CalibrateDrawingView(drawingDoc, sheet, linkedModelDoc, weldMapDoc)
+    Dim view
+    Set view = SelectDrawingViewFromList(sheet, "Select DrawingView for calibration")
+
+    If view Is Nothing Then
+        MsgBox "Calibration cancelled. No DrawingView selected.", vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim a3x, a3y, a3z, b3x, b3y, b3z, c3x, c3y, c3z
+    Dim a2x, a2y, b2x, b2y, c2x, c2y
+
+    If Not GetCalibration3DReferencePoint("A", view, linkedModelDoc, weldMapDoc, a3x, a3y, a3z) Then Exit Sub
+    If Not GetCalibration2DReferencePoint(drawingDoc, view, "A", a2x, a2y) Then Exit Sub
+
+    If Not GetCalibration3DReferencePoint("B", view, linkedModelDoc, weldMapDoc, b3x, b3y, b3z) Then Exit Sub
+    If Not GetCalibration2DReferencePoint(drawingDoc, view, "B", b2x, b2y) Then Exit Sub
+
+    If Not GetCalibration3DReferencePoint("C", view, linkedModelDoc, weldMapDoc, c3x, c3y, c3z) Then Exit Sub
+    If Not GetCalibration2DReferencePoint(drawingDoc, view, "C", c2x, c2y) Then Exit Sub
+
+    Dim calibration
+    Set calibration = BuildViewCalibrationRecord(view, _
+                                                 a3x, a3y, a3z, a2x, a2y, _
+                                                 b3x, b3y, b3z, b2x, b2y, _
+                                                 c3x, c3y, c3z, c2x, c2y)
+
+    If calibration Is Nothing Then
+        MsgBox "View calibration failed." & vbCrLf & _
+               "Use three non-collinear 3D reference points and their matching 2D drawing positions.", _
+               vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    If SaveViewCalibration(drawingDoc, calibration) Then
+        MsgBox "CalibrateDrawingView completed." & vbCrLf & vbCrLf & _
+               "View calibrated: " & ObjectName(view) & vbCrLf & _
+               "Calibration file: " & GetDictString(calibration, "_FilePath"), _
+               vbInformation, MACRO_NAME
+    Else
+        MsgBox "Calibration was calculated, but could not be saved.", vbExclamation, MACRO_NAME
+    End If
+End Sub
+
+Function SelectDrawingViewFromList(sheet, prompt)
+    Set SelectDrawingViewFromList = Nothing
+
+    Dim listText
+    listText = CandidateViewListText(sheet)
+
+    If Trim(listText) = "" Then Exit Function
+
+    Dim inputValue
+    inputValue = AskString(CStr(prompt) & ":" & vbCrLf & vbCrLf & _
+                           listText & vbCrLf & vbCrLf & _
+                           "Enter view number:", "1")
+
+    If Trim(inputValue) = "" Then Exit Function
+    If Not IsNumeric(Trim(inputValue)) Then Exit Function
+
+    Set SelectDrawingViewFromList = CandidateViewByOrdinal(sheet, CLng(inputValue))
+End Function
+
+Function GetCalibration3DReferencePoint(pointLabel, view, linkedModelDoc, weldMapDoc, ByRef x, ByRef y, ByRef z)
+    GetCalibration3DReferencePoint = False
+
+    Dim defaultName
+    defaultName = "REF_" & CalibrationViewKey(ObjectName(view)) & "_" & UCase(CStr(pointLabel))
+
+    Dim inputValue
+    inputValue = AskString("3D model reference point " & CStr(pointLabel) & ":" & vbCrLf & _
+                           "Enter point name from WELD_MAP/model or X,Y,Z coordinates." & vbCrLf & _
+                           "Recommended: create/select reference points in WELD_MAP.CATPart.", _
+                           defaultName)
+
+    If Trim(inputValue) = "" Then Exit Function
+
+    If TryParse3DPointText(inputValue, x, y, z) Then
+        GetCalibration3DReferencePoint = True
+        Exit Function
+    End If
+
+    Dim pointObj
+    Dim sourceDoc
+
+    Set pointObj = Nothing
+    Set sourceDoc = Nothing
+
+    If Not weldMapDoc Is Nothing Then
+        Set pointObj = FindGeometryObjectByName(weldMapDoc, inputValue)
+        If Not pointObj Is Nothing Then Set sourceDoc = weldMapDoc
+    End If
+
+    If pointObj Is Nothing Then
+        If Not linkedModelDoc Is Nothing Then
+            Set pointObj = FindGeometryObjectByName(linkedModelDoc, inputValue)
+            If Not pointObj Is Nothing Then Set sourceDoc = linkedModelDoc
+        End If
+    End If
+
+    If pointObj Is Nothing Then
+        MsgBox "3D reference point not found: " & CStr(inputValue), vbExclamation, MACRO_NAME
+        Exit Function
+    End If
+
+    If TryGetPointObjectCoordinates(sourceDoc, pointObj, x, y, z) Then
+        GetCalibration3DReferencePoint = True
+    Else
+        MsgBox "Could not read 3D coordinates from reference point: " & CStr(inputValue), _
+               vbExclamation, MACRO_NAME
+    End If
+End Function
+
+Function GetCalibration2DReferencePoint(drawingDoc, view, pointLabel, ByRef x, ByRef y)
+    GetCalibration2DReferencePoint = False
+
+    If TryIndicate2DReferencePoint(drawingDoc, view, pointLabel, x, y) Then
+        GetCalibration2DReferencePoint = True
+        Exit Function
+    End If
+
+    If TrySelect2DReferenceObject(drawingDoc, pointLabel, x, y) Then
+        GetCalibration2DReferencePoint = True
+        Exit Function
+    End If
+
+    Dim inputValue
+    inputValue = AskString("2D drawing reference point " & CStr(pointLabel) & ":" & vbCrLf & _
+                           "Enter X,Y coordinates in drawing/view millimeters.", "")
+
+    If Trim(inputValue) = "" Then Exit Function
+
+    If TryParse2DPointText(inputValue, x, y) Then
+        GetCalibration2DReferencePoint = True
+    Else
+        MsgBox "Invalid 2D coordinate format. Use X,Y.", vbExclamation, MACRO_NAME
+    End If
+End Function
+
+Function TryIndicate2DReferencePoint(drawingDoc, view, pointLabel, ByRef x, ByRef y)
+    TryIndicate2DReferencePoint = False
+
+    Dim sel
+    Set sel = Nothing
+
+    On Error Resume Next
+    Set sel = drawingDoc.Selection
+    If sel Is Nothing Then
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Dim filters(0)
+    Dim location(1)
+    Dim selectedObject
+    Dim status
+
+    filters(0) = "AnyObject"
+    Err.Clear
+    status = sel.IndicateOrSelectElement2D(view, _
+                                           "Click 2D drawing point " & CStr(pointLabel), _
+                                           filters, False, False, False, selectedObject, location)
+
+    If Err.Number = 0 Then
+        If UCase(CStr(status)) <> "CANCEL" And UCase(CStr(status)) <> "UNDO" And _
+           UCase(CStr(status)) <> "REDO" Then
+            x = CDbl(location(0))
+            y = CDbl(location(1))
+            If Err.Number = 0 Then TryIndicate2DReferencePoint = True
+        End If
+    End If
+
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function TrySelect2DReferenceObject(drawingDoc, pointLabel, ByRef x, ByRef y)
+    TrySelect2DReferenceObject = False
+
+    Dim sel
+    Set sel = Nothing
+
+    On Error Resume Next
+    Set sel = drawingDoc.Selection
+    If sel Is Nothing Then
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Dim filters(2)
+    Dim status
+    filters(0) = "Point2D"
+    filters(1) = "DrawingPoint"
+    filters(2) = "AnyObject"
+
+    sel.Clear
+    Err.Clear
+    status = sel.SelectElement2(filters, _
+                                "Select 2D reference point/object " & CStr(pointLabel) & _
+                                " on the calibrated view, or cancel to type X,Y.", False)
+
+    If Err.Number = 0 And UCase(CStr(status)) = "NORMAL" Then
+        Dim obj
+        Set obj = SelectionItemValue(sel, 1)
+        If Not obj Is Nothing Then
+            If TryGet2DObjectCenter(obj, x, y) Then TrySelect2DReferenceObject = True
+        End If
+    End If
+
+    sel.Clear
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function TryParse3DPointText(value, ByRef x, ByRef y, ByRef z)
+    TryParse3DPointText = False
+
+    Dim parts
+    parts = SplitCoordinateText(value)
+
+    If Not IsArray(parts) Then Exit Function
+    If UBound(parts) < 2 Then Exit Function
+    If Not LooksNumeric(parts(0)) Then Exit Function
+    If Not LooksNumeric(parts(1)) Then Exit Function
+    If Not LooksNumeric(parts(2)) Then Exit Function
+
+    x = ToDouble(parts(0))
+    y = ToDouble(parts(1))
+    z = ToDouble(parts(2))
+    TryParse3DPointText = True
+End Function
+
+Function TryParse2DPointText(value, ByRef x, ByRef y)
+    TryParse2DPointText = False
+
+    Dim parts
+    parts = SplitCoordinateText(value)
+
+    If Not IsArray(parts) Then Exit Function
+    If UBound(parts) < 1 Then Exit Function
+    If Not LooksNumeric(parts(0)) Then Exit Function
+    If Not LooksNumeric(parts(1)) Then Exit Function
+
+    x = ToDouble(parts(0))
+    y = ToDouble(parts(1))
+    TryParse2DPointText = True
+End Function
+
+Function SplitCoordinateText(value)
+    Dim s
+    s = Trim(CStr(value))
+    s = Replace(s, ";", ",")
+    s = Replace(s, vbTab, " ")
+
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    If InStr(s, ",") = 0 Then
+        s = Replace(s, " ", ",")
+    Else
+        s = Replace(s, " ", "")
+    End If
+
+    SplitCoordinateText = Split(s, ",")
+End Function
+
+Function LooksNumeric(value)
+    Dim re
+    Set re = CreateObject("VBScript.RegExp")
+    re.IgnoreCase = True
+    re.Global = False
+    re.Pattern = "^[+-]?[0-9]+([\\.,][0-9]+)?$"
+    LooksNumeric = re.Test(Trim(CStr(value)))
+End Function
+
+Function BuildViewCalibrationRecord(view, _
+                                    a3x, a3y, a3z, a2x, a2y, _
+                                    b3x, b3y, b3z, b2x, b2y, _
+                                    c3x, c3y, c3z, c2x, c2y)
+    Set BuildViewCalibrationRecord = Nothing
+
+    Dim rec
+    Set rec = CreateObject("Scripting.Dictionary")
+    rec.CompareMode = 1
+
+    SetDictString rec, "ViewKey", CalibrationViewKey(ObjectName(view))
+    SetDictString rec, "ViewName", ObjectName(view)
+
+    SetDictString rec, "A3X", CStr(a3x)
+    SetDictString rec, "A3Y", CStr(a3y)
+    SetDictString rec, "A3Z", CStr(a3z)
+    SetDictString rec, "A2X", CStr(a2x)
+    SetDictString rec, "A2Y", CStr(a2y)
+    SetDictString rec, "B3X", CStr(b3x)
+    SetDictString rec, "B3Y", CStr(b3y)
+    SetDictString rec, "B3Z", CStr(b3z)
+    SetDictString rec, "B2X", CStr(b2x)
+    SetDictString rec, "B2Y", CStr(b2y)
+    SetDictString rec, "C3X", CStr(c3x)
+    SetDictString rec, "C3Y", CStr(c3y)
+    SetDictString rec, "C3Z", CStr(c3z)
+    SetDictString rec, "C2X", CStr(c2x)
+    SetDictString rec, "C2Y", CStr(c2y)
+
+    If Not CalculateCalibrationMatrix(rec) Then Exit Function
+
+    Set BuildViewCalibrationRecord = rec
+End Function
+
+Function CalculateCalibrationMatrix(rec)
+    CalculateCalibrationMatrix = False
+
+    Dim ax, ay, az, bx, by, bz, cx, cy, cz
+    Dim a2x, a2y, b2x, b2y, c2x, c2y
+
+    ax = ToDouble(GetDictString(rec, "A3X"))
+    ay = ToDouble(GetDictString(rec, "A3Y"))
+    az = ToDouble(GetDictString(rec, "A3Z"))
+    bx = ToDouble(GetDictString(rec, "B3X"))
+    by = ToDouble(GetDictString(rec, "B3Y"))
+    bz = ToDouble(GetDictString(rec, "B3Z"))
+    cx = ToDouble(GetDictString(rec, "C3X"))
+    cy = ToDouble(GetDictString(rec, "C3Y"))
+    cz = ToDouble(GetDictString(rec, "C3Z"))
+
+    a2x = ToDouble(GetDictString(rec, "A2X"))
+    a2y = ToDouble(GetDictString(rec, "A2Y"))
+    b2x = ToDouble(GetDictString(rec, "B2X"))
+    b2y = ToDouble(GetDictString(rec, "B2Y"))
+    c2x = ToDouble(GetDictString(rec, "C2X"))
+    c2y = ToDouble(GetDictString(rec, "C2Y"))
+
+    Dim v1x, v1y, v1z, v2x, v2y, v2z
+    v1x = bx - ax
+    v1y = by - ay
+    v1z = bz - az
+    v2x = cx - ax
+    v2y = cy - ay
+    v2z = cz - az
+
+    Dim d11, d12, d22, den
+    d11 = Dot3(v1x, v1y, v1z, v1x, v1y, v1z)
+    d12 = Dot3(v1x, v1y, v1z, v2x, v2y, v2z)
+    d22 = Dot3(v2x, v2y, v2z, v2x, v2y, v2z)
+    den = (d11 * d22) - (d12 * d12)
+
+    If Abs(CDbl(den)) < 0.0000001 Then Exit Function
+
+    Dim ux, uy, uz, vx, vy, vz
+    Dim u0, v0
+
+    ux = ((d22 * v1x) - (d12 * v2x)) / den
+    uy = ((d22 * v1y) - (d12 * v2y)) / den
+    uz = ((d22 * v1z) - (d12 * v2z)) / den
+
+    vx = ((d11 * v2x) - (d12 * v1x)) / den
+    vy = ((d11 * v2y) - (d12 * v1y)) / den
+    vz = ((d11 * v2z) - (d12 * v1z)) / den
+
+    u0 = -Dot3(ux, uy, uz, ax, ay, az)
+    v0 = -Dot3(vx, vy, vz, ax, ay, az)
+
+    Dim du2x, du2y, dv2x, dv2y
+    du2x = b2x - a2x
+    du2y = b2y - a2y
+    dv2x = c2x - a2x
+    dv2y = c2y - a2y
+
+    SetDictString rec, "M11", CStr((du2x * ux) + (dv2x * vx))
+    SetDictString rec, "M12", CStr((du2x * uy) + (dv2x * vy))
+    SetDictString rec, "M13", CStr((du2x * uz) + (dv2x * vz))
+    SetDictString rec, "M14", CStr(a2x + (du2x * u0) + (dv2x * v0))
+
+    SetDictString rec, "M21", CStr((du2y * ux) + (dv2y * vx))
+    SetDictString rec, "M22", CStr((du2y * uy) + (dv2y * vy))
+    SetDictString rec, "M23", CStr((du2y * uz) + (dv2y * vz))
+    SetDictString rec, "M24", CStr(a2y + (du2y * u0) + (dv2y * v0))
+
+    CalculateCalibrationMatrix = True
+End Function
+
+Function Dot3(ax, ay, az, bx, by, bz)
+    Dot3 = (CDbl(ax) * CDbl(bx)) + (CDbl(ay) * CDbl(by)) + (CDbl(az) * CDbl(bz))
+End Function
+
+Function CalibrationFilePath(drawingDoc, promptIfUnsaved)
+    CalibrationFilePath = ""
+
+    Dim folderPath
+    folderPath = DrawingFolder(drawingDoc)
+
+    If Trim(folderPath) = "" And CBool(promptIfUnsaved) Then
+        folderPath = AskString("Drawing is not saved. Enter folder path for view calibration file:", "")
+    End If
+
+    If Trim(folderPath) = "" Then Exit Function
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    CalibrationFilePath = fso.BuildPath(folderPath, CALIBRATION_FILE_NAME)
+End Function
+
+Function LoadViewCalibrations(drawingDoc, promptIfUnsaved)
+    Dim calibrations
+    Set calibrations = CreateObject("Scripting.Dictionary")
+    calibrations.CompareMode = 1
+
+    Dim filePath
+    filePath = CalibrationFilePath(drawingDoc, promptIfUnsaved)
+
+    If Trim(filePath) <> "" Then
+        Dim fso
+        Set fso = CreateObject("Scripting.FileSystemObject")
+
+        If fso.FileExists(filePath) Then
+            Dim ts
+            Set ts = fso.OpenTextFile(filePath, 1, False)
+
+            Do Until ts.AtEndOfStream
+                Dim line
+                line = ts.ReadLine
+
+                If Trim(line) <> "" And UCase(Left(Trim(line), 7)) <> "VIEWKEY" Then
+                    Dim rec
+                    Set rec = ParseCalibrationCsvLine(line)
+
+                    If Not rec Is Nothing Then
+                        If Not calibrations.Exists(GetDictString(rec, "ViewKey")) Then
+                            calibrations.Add GetDictString(rec, "ViewKey"), rec
+                        Else
+                            Set calibrations.Item(GetDictString(rec, "ViewKey")) = rec
+                        End If
+                    End If
+                End If
+            Loop
+
+            ts.Close
+        End If
+    End If
+
+    Set LoadViewCalibrations = calibrations
+End Function
+
+Function SaveViewCalibration(drawingDoc, calibration)
+    SaveViewCalibration = False
+
+    Dim filePath
+    filePath = CalibrationFilePath(drawingDoc, True)
+    If Trim(filePath) = "" Then Exit Function
+    SetDictString calibration, "_FilePath", filePath
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim existing
+    Set existing = NewList()
+
+    If fso.FileExists(filePath) Then
+        Dim inFile
+        Set inFile = fso.OpenTextFile(filePath, 1, False)
+
+        Do Until inFile.AtEndOfStream
+            Dim line
+            line = inFile.ReadLine
+
+            If Trim(line) <> "" And UCase(Left(Trim(line), 7)) <> "VIEWKEY" Then
+                Dim rec
+                Set rec = ParseCalibrationCsvLine(line)
+
+                If Not rec Is Nothing Then
+                    If UCase(GetDictString(rec, "ViewKey")) <> UCase(GetDictString(calibration, "ViewKey")) Then
+                        ListAdd existing, CalibrationRecordToCsvLine(rec)
+                    End If
+                End If
+            End If
+        Loop
+
+        inFile.Close
+    End If
+
+    Dim outFile
+    Set outFile = fso.CreateTextFile(filePath, True)
+    outFile.WriteLine CalibrationCsvHeader()
+
+    Dim i
+    For i = 0 To existing.Count - 1
+        outFile.WriteLine CStr(existing.Item(CStr(i)))
+    Next
+
+    outFile.WriteLine CalibrationRecordToCsvLine(calibration)
+    outFile.Close
+
+    SaveViewCalibration = True
+End Function
+
+Function CalibrationCsvFields()
+    CalibrationCsvFields = Array("ViewKey", "ViewName", _
+        "M11", "M12", "M13", "M14", "M21", "M22", "M23", "M24", _
+        "A3X", "A3Y", "A3Z", "A2X", "A2Y", _
+        "B3X", "B3Y", "B3Z", "B2X", "B2Y", _
+        "C3X", "C3Y", "C3Z", "C2X", "C2Y")
+End Function
+
+Function CalibrationCsvHeader()
+    CalibrationCsvHeader = JoinArray(CalibrationCsvFields(), ";")
+End Function
+
+Function CalibrationRecordToCsvLine(rec)
+    Dim fields
+    fields = CalibrationCsvFields()
+
+    Dim values()
+    ReDim values(UBound(fields))
+
+    Dim i
+    For i = LBound(fields) To UBound(fields)
+        values(i) = Replace(GetDictString(rec, fields(i)), ";", ",")
+    Next
+
+    CalibrationRecordToCsvLine = JoinArray(values, ";")
+End Function
+
+Function ParseCalibrationCsvLine(line)
+    Set ParseCalibrationCsvLine = Nothing
+
+    Dim fields
+    Dim parts
+    fields = CalibrationCsvFields()
+    parts = Split(CStr(line), ";")
+
+    If UBound(parts) < UBound(fields) Then Exit Function
+
+    Dim rec
+    Set rec = CreateObject("Scripting.Dictionary")
+    rec.CompareMode = 1
+
+    Dim i
+    For i = LBound(fields) To UBound(fields)
+        SetDictString rec, fields(i), parts(i)
+    Next
+
+    If Not CalculateCalibrationMatrix(rec) Then Exit Function
+
+    Set ParseCalibrationCsvLine = rec
+End Function
+
+Function CalibrationViewKey(viewName)
+    Dim s
+    s = NormalizeName(viewName)
+    s = Replace(s, ".", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, "\", "")
+    s = Replace(s, ":", "")
+    s = Replace(s, "(", "")
+    s = Replace(s, ")", "")
+    If Trim(s) = "" Then s = "VIEW"
+    CalibrationViewKey = s
+End Function
+
+' ---------------------------------------------------------------------------
+' Label placement
+' ---------------------------------------------------------------------------
+
+Sub PlaceWeldLabels(drawingDoc, sheet, weldMapDoc, viewCalibrations, welds, sortedKeys, labelChoice, _
+                    ByRef placedCount, ByRef overlapWarningCount, unplacedLabels, _
+                    ByRef textFallbackCount, _
+                    labelDebugLines, ByRef modelGeometryFoundCount, ByRef projectedGeometryFoundCount, _
+                    ByRef labelPointCalculatedCount, ByRef projectionFailedCount, _
+                    ByRef placed3DProjectionCount, ByRef placedModelFallbackCount, _
+                    ByRef placed2DProjectionCount)
+    Dim placedPositions
+    Set placedPositions = NewList()
+
+    Dim i
+    Dim weldKey
+    Dim weld
+    Dim x3
+    Dim y3
+    Dim z3
+    Dim hasPoint
+    Dim targetView
+    Dim labelX
+    Dim labelY
+    Dim ok
+    Dim weldId
+    Dim weldPrefix
+    Dim modelFound
+    Dim projectedFound
+    Dim placed
+    Dim reason
+    Dim placementMethod
+    Dim labelPointSource
+
+    For i = LBound(sortedKeys) To UBound(sortedKeys)
+        weldKey = CStr(sortedKeys(i))
+        Set weld = welds.Item(weldKey)
+        weldId = GetDictString(weld, "WeldID")
+        weldPrefix = GetDictString(weld, "_Prefix")
+        reason = ""
+        placed = False
+
+        modelFound = HasModelWeldGeometry(weldMapDoc, weldPrefix, weldId)
+        If modelFound Then modelGeometryFoundCount = modelGeometryFoundCount + 1
+        ListAdd labelDebugLines, weldId & ": found in model = " & YesNoText(modelFound)
+
+        labelPointSource = ""
+        hasPoint = GetLabelPointWithSource(weldMapDoc, weld, x3, y3, z3, labelPointSource)
+        If hasPoint Then labelPointCalculatedCount = labelPointCalculatedCount + 1
+        ListAdd labelDebugLines, weldId & ": 3D label point calculated = " & YesNoText(hasPoint)
+        If hasPoint Then ListAdd labelDebugLines, weldId & ": 3D label point source = " & labelPointSource
+
+        If hasPoint Then
+            Set targetView = Nothing
+            labelX = 0.0
+            labelY = 0.0
+
+            ok = FindCalibratedDrawingViewForPoint(sheet, viewCalibrations, x3, y3, z3, _
+                                                   GetDictString(weld, "PreferredView"), _
+                                                   targetView, labelX, labelY, reason)
+
+            If ok And Not targetView Is Nothing Then
+                placementMethod = PlaceLabelOnView(targetView, weldId, labelChoice, placedPositions, labelX, labelY, overlapWarningCount)
+                If placementMethod <> "" Then
+                    placed3DProjectionCount = placed3DProjectionCount + 1
+                    If placementMethod = "SYMBOL" Then
+                        placedCount = placedCount + 1
+                    End If
+                    If placementMethod = "TEXT" Then textFallbackCount = textFallbackCount + 1
+                    placed = True
+                    ListAdd labelDebugLines, weldId & ": placed on view = Yes"
+                    ListAdd labelDebugLines, weldId & ": placement method = calibrated view transform / " & placementMethod
+                Else
+                    reason = "calibrated 2D point calculated, but Welding Symbol annotation creation failed"
+                End If
+            Else
+                projectionFailedCount = projectionFailedCount + 1
+                If Trim(reason) = "" Then reason = "no calibrated DrawingView transform"
+            End If
+        Else
+            If modelFound Then
+                reason = "3D label point could not be calculated from WELD_MAP geometry"
+            Else
+                reason = "WELD_MAP geometry not found in model"
+            End If
+        End If
+
+        projectedFound = False
+        ListAdd labelDebugLines, weldId & ": projected geometry fallback used = No"
+
+        If Not placed Then
+            If reason = "" Then reason = "automatic label placement failed"
+            ListAddUnique unplacedLabels, weldId
+            ListAdd labelDebugLines, weldId & ": placed on view = No"
+            ListAdd labelDebugLines, "Reason: " & reason
+        End If
+    Next
+End Sub
+
+Function PlaceLabelOnView(view, weldId, labelChoice, placedPositions, ByRef labelX, ByRef labelY, _
+                          ByRef overlapWarningCount)
+    PlaceLabelOnView = ""
+
+    Dim warning
+    Dim labelText
+    Dim arrowX
+    Dim arrowY
+    Dim textX
+    Dim textY
+
+    warning = False
+    labelText = FormatWeldLabel(weldId, labelChoice)
+    arrowX = CDbl(labelX)
+    arrowY = CDbl(labelY)
+    textX = arrowX + 10.0
+    textY = arrowY + 6.0
+
+    Call ApplyAntiOverlap(placedPositions, view.Name, textX, textY, warning)
+
+    If AddWeldSymbolAnnotation(view, labelText, weldId, textX, textY, arrowX, arrowY) Then
+        If warning Then overlapWarningCount = overlapWarningCount + 1
+        ListAdd placedPositions, view.Name & "|" & CStr(textX) & "|" & CStr(textY)
+        PlaceLabelOnView = "SYMBOL"
+        Exit Function
+    End If
+
+    If AddWeldLabelText(view, labelText, weldId, textX, textY, arrowX, arrowY) Then
+        If warning Then overlapWarningCount = overlapWarningCount + 1
+        ListAdd placedPositions, view.Name & "|" & CStr(textX) & "|" & CStr(textY)
+        PlaceLabelOnView = "TEXT"
+    End If
+End Function
+
+Function HasModelWeldGeometry(weldMapDoc, weldPrefix, weldId)
+    Dim geometryObject
+    Set geometryObject = FindGeometryObjectByName(weldMapDoc, weldPrefix)
+    If geometryObject Is Nothing Then Set geometryObject = FindGeometryObjectByName(weldMapDoc, weldId)
+    HasModelWeldGeometry = Not geometryObject Is Nothing
+End Function
+
+Function FindProjected2DWeldGeometry(sheet, drawingDoc, weldId, weldPrefix, ByRef targetView, ByRef labelX, ByRef labelY)
+    FindProjected2DWeldGeometry = False
+    Set targetView = Nothing
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim view
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                If TryFindNamed2DObjectInView(view, weldId, weldPrefix, labelX, labelY) Then
+                    Set targetView = view
+                    FindProjected2DWeldGeometry = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next
+
+    If TrySelectionSearchForProjected2D(drawingDoc, sheet, weldId, weldPrefix, targetView, labelX, labelY) Then
+        FindProjected2DWeldGeometry = True
+    End If
+End Function
+
+Function TryFindNamed2DObjectInView(view, weldId, weldPrefix, ByRef labelX, ByRef labelY)
+    TryFindNamed2DObjectInView = False
+
+    Dim collection
+
+    Set collection = Nothing
+    On Error Resume Next
+    Set collection = view.GeometricElements
+    On Error GoTo 0
+    If Not collection Is Nothing Then
+        If TryFindNamed2DObjectInCollection(view, collection, weldId, weldPrefix, labelX, labelY) Then
+            TryFindNamed2DObjectInView = True
+            Exit Function
+        End If
+    End If
+
+    Set collection = Nothing
+    On Error Resume Next
+    Set collection = view.Texts
+    On Error GoTo 0
+    If Not collection Is Nothing Then
+        If TryFindNamed2DObjectInCollection(view, collection, weldId, weldPrefix, labelX, labelY) Then
+            TryFindNamed2DObjectInView = True
+            Exit Function
+        End If
+    End If
+
+    Set collection = Nothing
+    On Error Resume Next
+    Set collection = view.Dimensions
+    On Error GoTo 0
+    If Not collection Is Nothing Then
+        If TryFindNamed2DObjectInCollection(view, collection, weldId, weldPrefix, labelX, labelY) Then
+            TryFindNamed2DObjectInView = True
+            Exit Function
+        End If
+    End If
+End Function
+
+Function TryFindNamed2DObjectInCollection(view, collection, weldId, weldPrefix, ByRef labelX, ByRef labelY)
+    TryFindNamed2DObjectInCollection = False
+
+    Dim countValue
+    Dim i
+    Dim obj
+
+    countValue = CollectionCount(collection)
+
+    For i = 1 To countValue
+        Set obj = Nothing
+        On Error Resume Next
+        Set obj = collection.Item(i)
+        On Error GoTo 0
+
+        If Not obj Is Nothing Then
+            If IsPossibleProjectedWeldObject(obj, weldId, weldPrefix) Then
+                If TryGet2DObjectCenter(obj, labelX, labelY) Then
+                    TryFindNamed2DObjectInCollection = True
+                    Exit Function
+                End If
+
+                If GetViewCenter(view, labelX, labelY) Then
+                    TryFindNamed2DObjectInCollection = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function TrySelectionSearchForProjected2D(drawingDoc, sheet, weldId, weldPrefix, ByRef targetView, ByRef labelX, ByRef labelY)
+    TrySelectionSearchForProjected2D = False
+
+    Dim sel
+    Set sel = Nothing
+
+    On Error Resume Next
+    Set sel = drawingDoc.Selection
+    On Error GoTo 0
+
+    If sel Is Nothing Then Exit Function
+
+    Dim patterns
+    Dim p
+    patterns = Array(CStr(weldPrefix), CStr(weldId))
+
+    For Each p In patterns
+        If Trim(CStr(p)) <> "" Then
+            On Error Resume Next
+            sel.Clear
+            sel.Search "Name=*" & CStr(p) & "*,all"
+            On Error GoTo 0
+
+            If TryUseSelectionSearchResult(sel, sheet, weldId, weldPrefix, targetView, labelX, labelY) Then
+                On Error Resume Next
+                sel.Clear
+                On Error GoTo 0
+                TrySelectionSearchForProjected2D = True
+                Exit Function
+            End If
+        End If
+    Next
+
+    On Error Resume Next
+    sel.Clear
+    On Error GoTo 0
+End Function
+
+Function TryUseSelectionSearchResult(sel, sheet, weldId, weldPrefix, ByRef targetView, ByRef labelX, ByRef labelY)
+    TryUseSelectionSearchResult = False
+
+    Dim countValue
+    Dim i
+    Dim obj
+    Dim view
+
+    countValue = SelectionCount(sel)
+
+    For i = 1 To countValue
+        Set obj = Nothing
+        Set obj = SelectionItemValue(sel, i)
+
+        If Not obj Is Nothing Then
+            If IsPossibleProjectedWeldObject(obj, weldId, weldPrefix) Then
+                Set view = FindOwningDrawingView(sheet, obj)
+                If view Is Nothing Then Set view = FirstCandidateView(sheet)
+
+                If Not view Is Nothing Then
+                    If TryGet2DObjectCenter(obj, labelX, labelY) Then
+                        Set targetView = view
+                        TryUseSelectionSearchResult = True
+                        Exit Function
+                    End If
+
+                    If GetViewCenter(view, labelX, labelY) Then
+                        Set targetView = view
+                        TryUseSelectionSearchResult = True
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function CollectionCount(collection)
+    CollectionCount = 0
+
+    On Error Resume Next
+    Err.Clear
+    CollectionCount = CLng(collection.Count)
+    If Err.Number <> 0 Then
+        Err.Clear
+        CollectionCount = CLng(collection.Count2)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        CollectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SelectionCount(sel)
+    SelectionCount = 0
+
+    On Error Resume Next
+    Err.Clear
+    SelectionCount = CLng(sel.Count2)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = CLng(sel.Count)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        SelectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SelectionItemValue(sel, indexValue)
+    Set SelectionItemValue = Nothing
+
+    Dim item
+    Set item = Nothing
+
+    On Error Resume Next
+    Set item = sel.Item2(indexValue)
+    If item Is Nothing Then Set item = sel.Item(indexValue)
+    If Not item Is Nothing Then Set SelectionItemValue = item.Value
+    On Error GoTo 0
+End Function
+
+Function IsPossibleProjectedWeldObject(obj, weldId, weldPrefix)
+    IsPossibleProjectedWeldObject = False
+
+    Dim nameValue
+    nameValue = UCase(ObjectName(obj))
+
+    If nameValue = "" Then Exit Function
+    If InStr(nameValue, "LABEL_") > 0 Then Exit Function
+    If InStr(nameValue, "UNPLACED") > 0 Then Exit Function
+    If InStr(nameValue, "TABLE") > 0 Then Exit Function
+
+    If Trim(CStr(weldPrefix)) <> "" Then
+        If InStr(nameValue, UCase(CStr(weldPrefix))) > 0 Then
+            IsPossibleProjectedWeldObject = True
+            Exit Function
+        End If
+    End If
+
+    If Trim(CStr(weldId)) <> "" Then
+        If InStr(nameValue, UCase(CStr(weldId))) > 0 Then
+            IsPossibleProjectedWeldObject = True
+            Exit Function
+        End If
+    End If
+End Function
+
+Function ObjectName(obj)
+    ObjectName = ""
+
+    On Error Resume Next
+    ObjectName = CStr(obj.Name)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ObjectName = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function TryGet2DObjectCenter(obj, ByRef x, ByRef y)
+    TryGet2DObjectCenter = False
+
+    If TryGet2DBoundingBoxCenter(obj, x, y) Then
+        TryGet2DObjectCenter = True
+        Exit Function
+    End If
+
+    If TryGetCurve2DCenter(obj, x, y) Then
+        TryGet2DObjectCenter = True
+        Exit Function
+    End If
+
+    If TryGet2DPointCoordinates(obj, x, y) Then
+        TryGet2DObjectCenter = True
+        Exit Function
+    End If
+End Function
+
+Function TryGet2DBoundingBoxCenter(obj, ByRef x, ByRef y)
+    TryGet2DBoundingBoxCenter = False
+
+    Dim box4(3)
+    Dim box6(5)
+
+    On Error Resume Next
+    Err.Clear
+    obj.GetBoundingBox box4
+    If Err.Number = 0 Then
+        x = (CDbl(box4(0)) + CDbl(box4(2))) / 2.0
+        y = (CDbl(box4(1)) + CDbl(box4(3))) / 2.0
+        TryGet2DBoundingBoxCenter = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    obj.GetBoundingBox box6
+    If Err.Number = 0 Then
+        x = (CDbl(box6(0)) + CDbl(box6(3))) / 2.0
+        y = (CDbl(box6(1)) + CDbl(box6(4))) / 2.0
+        TryGet2DBoundingBoxCenter = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    obj.GetBoundaryBox box4
+    If Err.Number = 0 Then
+        x = (CDbl(box4(0)) + CDbl(box4(2))) / 2.0
+        y = (CDbl(box4(1)) + CDbl(box4(3))) / 2.0
+        TryGet2DBoundingBoxCenter = True
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+End Function
+
+Function TryGetCurve2DCenter(obj, ByRef x, ByRef y)
+    TryGetCurve2DCenter = False
+
+    Dim startPoint
+    Dim endPoint
+    Dim centerPoint
+    Dim x1
+    Dim y1
+    Dim x2
+    Dim y2
+
+    Set centerPoint = Nothing
+    On Error Resume Next
+    Set centerPoint = obj.CenterPoint
+    On Error GoTo 0
+
+    If Not centerPoint Is Nothing Then
+        If TryGet2DPointCoordinates(centerPoint, x, y) Then
+            TryGetCurve2DCenter = True
+            Exit Function
+        End If
+    End If
+
+    Set startPoint = Nothing
+    Set endPoint = Nothing
+
+    On Error Resume Next
+    Set startPoint = obj.StartPoint
+    Set endPoint = obj.EndPoint
+    On Error GoTo 0
+
+    If Not startPoint Is Nothing And Not endPoint Is Nothing Then
+        If TryGet2DPointCoordinates(startPoint, x1, y1) Then
+            If TryGet2DPointCoordinates(endPoint, x2, y2) Then
+                x = (CDbl(x1) + CDbl(x2)) / 2.0
+                y = (CDbl(y1) + CDbl(y2)) / 2.0
+                TryGetCurve2DCenter = True
+                Exit Function
+            End If
+        End If
+    End If
+End Function
+
+Function TryGet2DPointCoordinates(pointObj, ByRef x, ByRef y)
+    TryGet2DPointCoordinates = False
+
+    Dim coords(1)
+    Dim xValue
+    Dim yValue
+
+    On Error Resume Next
+    Err.Clear
+    pointObj.GetCoordinates coords
+    If Err.Number = 0 Then
+        x = CDbl(coords(0))
+        y = CDbl(coords(1))
+        TryGet2DPointCoordinates = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    pointObj.GetCoordinates xValue, yValue
+    If Err.Number = 0 Then
+        x = CDbl(xValue)
+        y = CDbl(yValue)
+        TryGet2DPointCoordinates = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    x = CDbl(pointObj.X)
+    y = CDbl(pointObj.Y)
+    If Err.Number = 0 Then
+        TryGet2DPointCoordinates = True
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+End Function
+
+Function FindOwningDrawingView(sheet, obj)
+    Set FindOwningDrawingView = Nothing
+
+    Dim parentObj
+    Dim depth
+
+    Set parentObj = Nothing
+    On Error Resume Next
+    Set parentObj = obj.Parent
+    On Error GoTo 0
+
+    For depth = 1 To 12
+        If parentObj Is Nothing Then Exit Function
+
+        If TypeName(parentObj) = "DrawingView" Then
+            Set FindOwningDrawingView = parentObj
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Set parentObj = parentObj.Parent
+        If Err.Number <> 0 Then
+            Err.Clear
+            Set parentObj = Nothing
+        End If
+        On Error GoTo 0
+    Next
+End Function
+
+Function FirstCandidateView(sheet)
+    Set FirstCandidateView = Nothing
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim view
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                Set FirstCandidateView = view
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Function GetViewCenter(view, ByRef x, ByRef y)
+    GetViewCenter = False
+
+    Dim xMin
+    Dim xMax
+    Dim yMin
+    Dim yMax
+
+    If GetViewBounds(view, xMin, xMax, yMin, yMax) Then
+        x = (CDbl(xMin) + CDbl(xMax)) / 2.0
+        y = (CDbl(yMin) + CDbl(yMax)) / 2.0
+        GetViewCenter = True
+    End If
+End Function
+
+Function GetLabelPoint(weldMapDoc, weld, ByRef x, ByRef y, ByRef z)
+    Dim source
+    source = ""
+    GetLabelPoint = GetLabelPointWithSource(weldMapDoc, weld, x, y, z, source)
+End Function
+
+Function GetLabelPointWithSource(weldMapDoc, weld, ByRef x, ByRef y, ByRef z, ByRef source)
+    GetLabelPointWithSource = False
+    source = ""
+
+    If TryGetAnchorPoint(weldMapDoc, weld, x, y, z) Then
+        source = "ANCHOR_POINT"
+        GetLabelPointWithSource = True
+        Exit Function
+    End If
+
+    Dim sx
+    Dim sy
+    Dim sz
+
+    sx = Trim(GetDictString(weld, "LabelPointX"))
+    sy = Trim(GetDictString(weld, "LabelPointY"))
+    sz = Trim(GetDictString(weld, "LabelPointZ"))
+
+    If sx <> "" And sy <> "" And sz <> "" Then
+        x = ToDouble(sx)
+        y = ToDouble(sy)
+        z = ToDouble(sz)
+        source = "LABEL_POINT_PARAMETERS"
+        GetLabelPointWithSource = True
+        Exit Function
+    End If
+
+    GetLabelPointWithSource = TryGetGeometryLabelPoint(weldMapDoc, GetDictString(weld, "_Prefix"), _
+                                                       GetDictString(weld, "WeldID"), x, y, z)
+
+    If GetLabelPointWithSource Then
+        source = "GEOMETRY_FALLBACK"
+        Call SaveWeldLabelPointParameters(weldMapDoc, GetDictString(weld, "_Prefix"), x, y, z)
+    End If
+End Function
+
+Function IsAnchorLabelPointSource(source)
+    Dim s
+    s = UCase(Trim(CStr(source)))
+    IsAnchorLabelPointSource = (s = "ANCHOR_POINT" Or s = "LABEL_POINT_PARAMETERS")
+End Function
+
+Function TryGetAnchorPoint(weldMapDoc, weld, ByRef x, ByRef y, ByRef z)
+    TryGetAnchorPoint = False
+
+    Dim anchorName
+    anchorName = Trim(GetDictString(weld, "AnchorName"))
+    If anchorName = "" Then anchorName = "ANCHOR_" & GetDictString(weld, "WeldID")
+
+    Dim anchorObj
+    Set anchorObj = FindGeometryObjectByName(weldMapDoc, anchorName)
+
+    If anchorObj Is Nothing Then Exit Function
+
+    TryGetAnchorPoint = TryGetPointObjectCoordinates(weldMapDoc, anchorObj, x, y, z)
+End Function
+
+Function TryGetPointObjectCoordinates(weldMapDoc, pointObj, ByRef x, ByRef y, ByRef z)
+    TryGetPointObjectCoordinates = False
+
+    Dim coords(2)
+
+    On Error Resume Next
+    Err.Clear
+    pointObj.GetCoordinates coords
+    If Err.Number = 0 Then
+        x = CDbl(coords(0))
+        y = CDbl(coords(1))
+        z = CDbl(coords(2))
+        TryGetPointObjectCoordinates = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    x = CDbl(pointObj.X.Value)
+    y = CDbl(pointObj.Y.Value)
+    z = CDbl(pointObj.Z.Value)
+    If Err.Number = 0 Then
+        TryGetPointObjectCoordinates = True
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    TryGetPointObjectCoordinates = TryGetGeometryLabelPoint(weldMapDoc, ObjectName(pointObj), "", x, y, z)
+End Function
+
+Function TryGetGeometryLabelPoint(weldMapDoc, weldPrefix, weldId, ByRef x, ByRef y, ByRef z)
+    TryGetGeometryLabelPoint = False
+
+    Dim geometryObject
+    Set geometryObject = FindGeometryObjectByName(weldMapDoc, weldPrefix)
+    If geometryObject Is Nothing Then Set geometryObject = FindGeometryObjectByName(weldMapDoc, weldId)
+
+    If geometryObject Is Nothing Then Exit Function
+
+    Dim part
+    Dim reference
+    Dim spaWorkbench
+    Dim measurable
+
+    Set part = Nothing
+    Set reference = Nothing
+    Set spaWorkbench = Nothing
+    Set measurable = Nothing
+
+    On Error Resume Next
+    Set part = weldMapDoc.Part
+    Set reference = part.CreateReferenceFromObject(geometryObject)
+    Set spaWorkbench = weldMapDoc.GetWorkbench("SPAWorkbench")
+    Set measurable = spaWorkbench.GetMeasurable(reference)
+    On Error GoTo 0
+
+    If measurable Is Nothing Then Exit Function
+
+    Dim coords(2)
+    Dim pts(8)
+    Dim box(5)
+
+    On Error Resume Next
+    Err.Clear
+    measurable.GetPointsOnCurve pts
+    If Err.Number = 0 Then
+        x = CDbl(pts(3))
+        y = CDbl(pts(4))
+        z = CDbl(pts(5))
+        TryGetGeometryLabelPoint = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    measurable.GetCenter coords
+    If Err.Number = 0 Then
+        x = CDbl(coords(0))
+        y = CDbl(coords(1))
+        z = CDbl(coords(2))
+        TryGetGeometryLabelPoint = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    measurable.GetCOG coords
+    If Err.Number = 0 Then
+        x = CDbl(coords(0))
+        y = CDbl(coords(1))
+        z = CDbl(coords(2))
+        TryGetGeometryLabelPoint = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    measurable.GetBoundingBox box
+    If Err.Number = 0 Then
+        x = (CDbl(box(0)) + CDbl(box(3))) / 2.0
+        y = (CDbl(box(1)) + CDbl(box(4))) / 2.0
+        z = (CDbl(box(2)) + CDbl(box(5))) / 2.0
+        TryGetGeometryLabelPoint = True
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+End Function
+
+Sub SaveWeldLabelPointParameters(weldMapDoc, weldPrefix, x, y, z)
+    If Trim(CStr(weldPrefix)) = "" Then Exit Sub
+
+    On Error Resume Next
+    Call SetPartStringParameter(weldMapDoc.Part, CStr(weldPrefix) & "_LabelPointX", CStr(x))
+    Call SetPartStringParameter(weldMapDoc.Part, CStr(weldPrefix) & "_LabelPointY", CStr(y))
+    Call SetPartStringParameter(weldMapDoc.Part, CStr(weldPrefix) & "_LabelPointZ", CStr(z))
+    weldMapDoc.Part.Update
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+Sub SetPartStringParameter(part, parameterName, parameterValue)
+    Dim params
+    Dim p
+
+    Set params = Nothing
+    Set p = Nothing
+
+    On Error Resume Next
+    Set params = part.Parameters
+    Set p = params.Item(CStr(parameterName))
+
+    If p Is Nothing Or Err.Number <> 0 Then
+        Err.Clear
+        Set p = params.CreateString(CStr(parameterName), CStr(parameterValue))
+    Else
+        p.Value = CStr(parameterValue)
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+Function FindGeometryObjectByName(weldMapDoc, objectName)
+    Set FindGeometryObjectByName = Nothing
+
+    If Trim(CStr(objectName)) = "" Then Exit Function
+
+    Dim sel
+    Set sel = Nothing
+
+    On Error Resume Next
+    Set sel = weldMapDoc.Selection
+    sel.Clear
+    sel.Search "Name=" & CStr(objectName) & ",all"
+    If sel.Count2 > 0 Then
+        Set FindGeometryObjectByName = sel.Item2(1).Value
+    End If
+
+    If FindGeometryObjectByName Is Nothing Then
+        Err.Clear
+        sel.Clear
+        sel.Search "Name=*" & CStr(objectName) & "*,all"
+        If sel.Count2 > 0 Then
+            Set FindGeometryObjectByName = sel.Item2(1).Value
+        End If
+    End If
+    sel.Clear
+    On Error GoTo 0
+End Function
+
+Function FindCalibratedDrawingViewForPoint(sheet, calibrations, x3, y3, z3, preferredView, _
+                                           ByRef targetView, ByRef labelX, ByRef labelY, ByRef reason)
+    FindCalibratedDrawingViewForPoint = False
+    Set targetView = Nothing
+    reason = ""
+
+    If calibrations Is Nothing Then
+        reason = "No calibrated DrawingView found. Run CalibrateDrawingView first."
+        Exit Function
+    End If
+
+    If calibrations.Count = 0 Then
+        reason = "No calibrated DrawingView found. Run CalibrateDrawingView first."
+        Exit Function
+    End If
+
+    Dim requestedView
+    requestedView = Trim(CStr(preferredView))
+
+    If requestedView <> "" And UCase(requestedView) <> "AUTO" Then
+        Dim preferredDrawingView
+        Set preferredDrawingView = FindCalibratedViewByPreferredName(sheet, calibrations, requestedView)
+
+        If preferredDrawingView Is Nothing Then
+            reason = "View " & requestedView & " is not calibrated. Run CalibrateDrawingView first."
+            Exit Function
+        End If
+
+        Dim preferredCalibration
+        Set preferredCalibration = CalibrationForView(calibrations, preferredDrawingView)
+
+        If preferredCalibration Is Nothing Then
+            reason = "View " & requestedView & " is not calibrated. Run CalibrateDrawingView first."
+            Exit Function
+        End If
+
+        If Transform3DByCalibration(preferredCalibration, x3, y3, z3, labelX, labelY) Then
+            Set targetView = preferredDrawingView
+            FindCalibratedDrawingViewForPoint = True
+        Else
+            reason = "Calibrated transform failed for view " & requestedView & "."
+        End If
+
+        Exit Function
+    End If
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then
+        reason = "No DrawingView collection found on active sheet."
+        Exit Function
+    End If
+
+    Dim i
+    Dim view
+    Dim calibration
+    Dim px
+    Dim py
+    Dim bestScale
+    Dim scaleValue
+    Dim firstView
+    Dim firstCalibration
+    Dim firstX
+    Dim firstY
+
+    bestScale = -1.0
+    Set firstView = Nothing
+    Set firstCalibration = Nothing
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                Set calibration = CalibrationForView(calibrations, view)
+
+                If Not calibration Is Nothing Then
+                    If Transform3DByCalibration(calibration, x3, y3, z3, px, py) Then
+                        If firstView Is Nothing Then
+                            Set firstView = view
+                            Set firstCalibration = calibration
+                            firstX = px
+                            firstY = py
+                        End If
+
+                        If PointInsideViewBounds(view, px, py) Then
+                            scaleValue = GetViewScale(view)
+                            If Not FindCalibratedDrawingViewForPoint Or scaleValue > bestScale Then
+                                Set targetView = view
+                                labelX = px
+                                labelY = py
+                                bestScale = scaleValue
+                                FindCalibratedDrawingViewForPoint = True
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next
+
+    If FindCalibratedDrawingViewForPoint Then Exit Function
+
+    If Not firstView Is Nothing Then
+        Set targetView = firstView
+        labelX = firstX
+        labelY = firstY
+        FindCalibratedDrawingViewForPoint = True
+        Exit Function
+    End If
+
+    reason = "No calibrated DrawingView matched this weld. Run CalibrateDrawingView first."
+End Function
+
+Function FindCalibratedViewByPreferredName(sheet, calibrations, preferredView)
+    Set FindCalibratedViewByPreferredName = Nothing
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim view
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                If ViewMatchesPreferredName(view, preferredView) Then
+                    Dim calibration
+                    Set calibration = CalibrationForView(calibrations, view)
+
+                    If Not calibration Is Nothing Then
+                        Set FindCalibratedViewByPreferredName = view
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function CalibrationForView(calibrations, view)
+    Set CalibrationForView = Nothing
+
+    If calibrations Is Nothing Then Exit Function
+
+    Dim key
+    key = CalibrationViewKey(ObjectName(view))
+
+    If calibrations.Exists(key) Then
+        Set CalibrationForView = calibrations.Item(key)
+        Exit Function
+    End If
+
+    Dim existingKey
+    For Each existingKey In calibrations.Keys
+        If UCase(GetDictString(calibrations.Item(existingKey), "ViewName")) = UCase(ObjectName(view)) Then
+            Set CalibrationForView = calibrations.Item(existingKey)
+            Exit Function
+        End If
+    Next
+End Function
+
+Function Transform3DByCalibration(calibration, x3, y3, z3, ByRef px, ByRef py)
+    Transform3DByCalibration = False
+
+    If calibration Is Nothing Then Exit Function
+
+    On Error Resume Next
+    px = (ToDouble(GetDictString(calibration, "M11")) * CDbl(x3)) + _
+         (ToDouble(GetDictString(calibration, "M12")) * CDbl(y3)) + _
+         (ToDouble(GetDictString(calibration, "M13")) * CDbl(z3)) + _
+          ToDouble(GetDictString(calibration, "M14"))
+
+    py = (ToDouble(GetDictString(calibration, "M21")) * CDbl(x3)) + _
+         (ToDouble(GetDictString(calibration, "M22")) * CDbl(y3)) + _
+         (ToDouble(GetDictString(calibration, "M23")) * CDbl(z3)) + _
+          ToDouble(GetDictString(calibration, "M24"))
+
+    If Err.Number = 0 Then Transform3DByCalibration = True
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function FindBestDrawingViewForPoint(sheet, x3, y3, z3, preferredView, ByRef targetView, ByRef labelX, ByRef labelY)
+    FindBestDrawingViewForPoint = False
+    Set targetView = Nothing
+
+    If Trim(CStr(preferredView)) <> "" And UCase(Trim(CStr(preferredView))) <> "AUTO" Then
+        If FindDrawingViewForPoint(sheet, x3, y3, z3, preferredView, targetView, labelX, labelY) Then
+            FindBestDrawingViewForPoint = True
+            Exit Function
+        End If
+    End If
+
+    FindBestDrawingViewForPoint = FindDrawingViewForPoint(sheet, x3, y3, z3, "", targetView, labelX, labelY)
+End Function
+
+Function FindDrawingViewForPoint(sheet, x3, y3, z3, viewNameFilter, ByRef targetView, ByRef labelX, ByRef labelY)
+    FindDrawingViewForPoint = False
+    Set targetView = Nothing
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim view
+    Dim px
+    Dim py
+    Dim inside
+    Dim projected
+    Dim scaleValue
+    Dim bestScale
+
+    bestScale = -1.0
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                If ViewMatchesPreferredName(view, viewNameFilter) Then
+                    px = 0.0
+                    py = 0.0
+                    projected = Project3DPointToView(view, x3, y3, z3, px, py)
+
+                    If projected Then
+                        inside = PointInsideViewBounds(view, px, py)
+
+                        If inside Then
+                            scaleValue = GetViewScale(view)
+
+                            If Not FindDrawingViewForPoint Or scaleValue > bestScale Then
+                                Set targetView = view
+                                labelX = px
+                                labelY = py
+                                bestScale = scaleValue
+                                FindDrawingViewForPoint = True
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function ViewMatchesPreferredName(view, viewNameFilter)
+    ViewMatchesPreferredName = True
+
+    If Trim(CStr(viewNameFilter)) = "" Then Exit Function
+
+    Dim n
+    n = UCase(ObjectName(view))
+
+    If InStr(n, UCase(CStr(viewNameFilter))) = 0 Then
+        ViewMatchesPreferredName = False
+    End If
+End Function
+
+Function Project3DPointToView(view, x3, y3, z3, ByRef px, ByRef py)
+    Project3DPointToView = False
+
+    Dim gb
+    Set gb = Nothing
+
+    On Error Resume Next
+    Set gb = view.GenerativeBehavior
+    On Error GoTo 0
+
+    If gb Is Nothing Then Exit Function
+
+    Dim origin(2)
+    Dim axisH(2)
+    Dim axisV(2)
+    Dim vx
+    Dim vy
+    Dim vz
+    Dim scaleValue
+
+    On Error Resume Next
+    Err.Clear
+    gb.GetProjectionPlane origin, axisH, axisV
+    If Err.Number <> 0 Then
+        Err.Clear
+        gb.GetProjectionPlaneAxis origin, axisH, axisV
+    End If
+    If Err.Number <> 0 Then
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    vx = CDbl(x3) - CDbl(origin(0))
+    vy = CDbl(y3) - CDbl(origin(1))
+    vz = CDbl(z3) - CDbl(origin(2))
+
+    scaleValue = GetViewScale(view)
+
+    px = (vx * CDbl(axisH(0)) + vy * CDbl(axisH(1)) + vz * CDbl(axisH(2))) * scaleValue
+    py = (vx * CDbl(axisV(0)) + vy * CDbl(axisV(1)) + vz * CDbl(axisV(2))) * scaleValue
+
+    Project3DPointToView = True
+End Function
+
+Function PointInsideViewBounds(view, px, py)
+    PointInsideViewBounds = True
+
+    Dim xMin
+    Dim xMax
+    Dim yMin
+    Dim yMax
+    Dim ok
+
+    ok = GetViewBounds(view, xMin, xMax, yMin, yMax)
+
+    If ok Then
+        PointInsideViewBounds = (CDbl(px) >= CDbl(xMin) And CDbl(px) <= CDbl(xMax) And _
+                                 CDbl(py) >= CDbl(yMin) And CDbl(py) <= CDbl(yMax))
+    End If
+End Function
+
+Function GetViewBounds(view, ByRef xMin, ByRef xMax, ByRef yMin, ByRef yMax)
+    GetViewBounds = False
+
+    Dim a
+    Dim b
+    Dim c
+    Dim d
+
+    On Error Resume Next
+    Err.Clear
+    view.Size a, b, c, d
+    If Err.Number = 0 Then
+        xMin = CDbl(a)
+        xMax = CDbl(b)
+        yMin = CDbl(c)
+        yMax = CDbl(d)
+
+        If xMin > xMax Then SwapDouble xMin, xMax
+        If yMin > yMax Then SwapDouble yMin, yMax
+
+        GetViewBounds = True
+    End If
+    On Error GoTo 0
+End Function
+
+Sub SwapDouble(ByRef a, ByRef b)
+    Dim t
+    t = a
+    a = b
+    b = t
+End Sub
+
+Function GetViewScale(view)
+    GetViewScale = 1.0
+    On Error Resume Next
+    Err.Clear
+    GetViewScale = CDbl(view.Scale)
+    If Err.Number <> 0 Then
+        Err.Clear
+        GetViewScale = CDbl(view.Scale2)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        GetViewScale = 1.0
+    End If
+    On Error GoTo 0
+End Function
+
+Function IsCandidateLabelView(view)
+    IsCandidateLabelView = True
+
+    Dim n
+    n = ""
+    On Error Resume Next
+    n = UCase(CStr(view.Name))
+    On Error GoTo 0
+
+    If InStr(n, "BACKGROUND") > 0 Then IsCandidateLabelView = False
+End Function
+
+Sub ApplyAntiOverlap(placedPositions, viewName, ByRef x, ByRef y, ByRef warning)
+    Dim attempt
+    warning = False
+
+    For attempt = 1 To LABEL_MAX_SHIFT_ATTEMPTS
+        If Not HasOverlap(placedPositions, viewName, x, y) Then Exit Sub
+        x = x + LABEL_SHIFT_MM
+        y = y + LABEL_SHIFT_MM
+    Next
+
+    If HasOverlap(placedPositions, viewName, x, y) Then warning = True
+End Sub
+
+Function HasOverlap(placedPositions, viewName, x, y)
+    HasOverlap = False
+
+    Dim i
+    Dim itemValue
+    Dim parts
+    Dim dx
+    Dim dy
+
+    For i = 0 To placedPositions.Count - 1
+        itemValue = CStr(placedPositions.Item(CStr(i)))
+        parts = Split(itemValue, "|")
+
+        If UBound(parts) >= 2 Then
+            If CStr(parts(0)) = CStr(viewName) Then
+                dx = CDbl(x) - ToDouble(parts(1))
+                dy = CDbl(y) - ToDouble(parts(2))
+
+                If (dx * dx + dy * dy) < (LABEL_MIN_DISTANCE_MM * LABEL_MIN_DISTANCE_MM) Then
+                    HasOverlap = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function AddWeldSymbolAnnotation(view, labelText, weldId, x, y, arrowX, arrowY)
+    AddWeldSymbolAnnotation = False
+
+    Dim weldings
+    Dim welding
+    Dim initialCount
+
+    Set weldings = Nothing
+    Set welding = Nothing
+    initialCount = 0
+
+    On Error Resume Next
+    Set weldings = view.Weldings
+    If Err.Number <> 0 Or weldings Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    initialCount = CollectionCount(weldings)
+
+    Set welding = weldings.Add(catNoneMainWelding, CDbl(x), CDbl(y))
+    If Err.Number <> 0 Or welding Is Nothing Then
+        Err.Clear
+        Set welding = weldings.Add(0, CDbl(x), CDbl(y))
+    End If
+
+    If Err.Number <> 0 Or welding Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    welding.Name = "WELD_SYMBOL_" & CStr(weldId)
+
+    Call ClearWeldingMainSymbols(welding)
+
+    If Not SetWeldingPrimarySizeText(welding, CStr(labelText)) Then
+        Call RemoveLastWeldingIfCreated(weldings, initialCount)
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Call AddLeaderToAnnotation(welding, arrowX, arrowY)
+
+    On Error Resume Next
+    welding.TextProperties.Update
+    Err.Clear
+    On Error GoTo 0
+
+    AddWeldSymbolAnnotation = True
+End Function
+
+Sub AddLeaderToAnnotation(annotationObj, arrowX, arrowY)
+    On Error Resume Next
+
+    Dim leaders
+    Dim leader
+
+    Set leaders = Nothing
+    Set leader = Nothing
+
+    Set leaders = annotationObj.Leaders
+    If Err.Number = 0 And Not leaders Is Nothing Then
+        Set leader = leaders.Add(CDbl(arrowX), CDbl(arrowY))
+        Err.Clear
+    Else
+        Err.Clear
+    End If
+
+    On Error GoTo 0
+End Sub
+
+Sub RemoveLastWeldingIfCreated(weldings, initialCount)
+    Dim currentCount
+    currentCount = CollectionCount(weldings)
+
+    If currentCount > CLng(initialCount) Then
+        On Error Resume Next
+        weldings.Remove currentCount
+        Err.Clear
+        On Error GoTo 0
+    End If
+End Sub
+
+Sub ClearWeldingMainSymbols(welding)
+    On Error Resume Next
+    Err.Clear
+    welding.SetSymbol catNoneMainWelding, catFirstWelding
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetSymbol catNoneMainWelding, catSecondWelding
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetSymbol 0, 1
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetSymbol 0, 2
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetAdditionalSymbol catNoneAddWelding, catFirstWelding
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetAdditionalSymbol catNoneAddWelding, catSecondWelding
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetAdditionalSymbol 0, 1
+    If Err.Number <> 0 Then Err.Clear
+    welding.SetAdditionalSymbol 0, 2
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Sub
+
+Function SetWeldingPrimarySizeText(welding, labelText)
+    SetWeldingPrimarySizeText = False
+
+    If SetWeldingTextRangeByNamedField(welding, labelText) Then
+        SetWeldingPrimarySizeText = True
+        Exit Function
+    End If
+
+    If SetWeldingTextRangeByIndex(welding, 1, labelText) Then
+        SetWeldingPrimarySizeText = True
+        Exit Function
+    End If
+
+    If SetWeldingTextRangeByIndex(welding, 0, labelText) Then
+        SetWeldingPrimarySizeText = True
+        Exit Function
+    End If
+End Function
+
+Function SetWeldingTextRangeByNamedField(welding, labelText)
+    SetWeldingTextRangeByNamedField = False
+
+    Dim textRange
+    Set textRange = Nothing
+
+    On Error Resume Next
+    Err.Clear
+    Set textRange = welding.GetTextRange(catWeldingFieldOne)
+    If Err.Number = 0 And Not textRange Is Nothing Then
+        textRange.Text = CStr(labelText)
+        If Err.Number = 0 Then SetWeldingTextRangeByNamedField = True
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function SetWeldingTextRangeByIndex(welding, fieldIndex, labelText)
+    SetWeldingTextRangeByIndex = False
+
+    Dim textRange
+    Set textRange = Nothing
+
+    On Error Resume Next
+    Err.Clear
+    Set textRange = welding.GetTextRange(CLng(fieldIndex))
+    If Err.Number = 0 And Not textRange Is Nothing Then
+        textRange.Text = CStr(labelText)
+        If Err.Number = 0 Then SetWeldingTextRangeByIndex = True
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function AddWeldLabelText(view, labelText, weldId, x, y, arrowX, arrowY)
+    AddWeldLabelText = False
+
+    Dim txt
+    Set txt = Nothing
+
+    On Error Resume Next
+    Set txt = view.Texts.Add(CStr(labelText), CDbl(x), CDbl(y))
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    txt.Name = "LABEL_" & CStr(weldId)
+    txt.SetFontSize 0, 0, DEFAULT_TEXT_HEIGHT_MM
+
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
+    Call AddLeaderToAnnotation(txt, arrowX, arrowY)
+
+    AddWeldLabelText = True
+End Function
+
+Function FormatWeldLabel(weldId, labelChoice)
+    Dim id
+    Dim digits
+    id = NormalizeWeldId(weldId)
+    digits = CStr(WeldSortNumber(id))
+
+    If Trim(CStr(labelChoice)) = "2" Then
+        FormatWeldLabel = "WELD" & PadLeft(digits, 3, "0")
+    Else
+        FormatWeldLabel = id
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Table presets and rows
+' ---------------------------------------------------------------------------
+
+Function WeldJointTableTitle()
+    WeldJointTableTitle = "TABELA ZAVARENIH SPOJEVA"
+End Function
+
+Function MaterialConsumptionTableTitle()
+    MaterialConsumptionTableTitle = "UTRO" & ChrW(352) & "AK DODATNOG MATERIJALA"
+End Function
+
+Function SummaryTitleText()
+    SummaryTitleText = "ZAKLJU" & ChrW(268) & "AK"
+End Function
+
+Function DiameterSymbol()
+    DiameterSymbol = ChrW(216)
+End Function
+
+Function SimpleWeldJointHeaders()
+    SimpleWeldJointHeaders = Array("Br. zav. spoja", _
+                                   "Poz. / Poz.", _
+                                   "Debljina / Debljina", _
+                                   "Materijal / Materijal", _
+                                   "Br. WPS liste", _
+                                   "Postupak", _
+                                   ChrW(381) & "ica / dodatni materijal")
+End Function
+
+Function MaterialConsumptionHeaders()
+    MaterialConsumptionHeaders = Array("Postupak", _
+                                       "Dodatni materijal", _
+                                       "Oznaka", _
+                                       DiameterSymbol(), _
+                                       "Ukupna du" & ChrW(382) & "ina zavara [m]", _
+                                       "Procena potro" & ChrW(353) & "nje [kg]", _
+                                       "Gas [L]", _
+                                       "Gas [boce 40L/200bar]")
+End Function
+
+Function BuildSimpleWeldJointRows(welds, sortedKeys, bomMaps, modelDoc)
+    Dim rows
+    Set rows = NewList()
+
+    Dim i
+    Dim weld
+    Dim row
+    Dim partANumber
+    Dim partBNumber
+
+    For i = LBound(sortedKeys) To UBound(sortedKeys)
+        Set weld = welds.Item(CStr(sortedKeys(i)))
+        row = Array("", "", "", "", "", "", "")
+
+        partANumber = GetDictString(weld, "PartA_Number")
+        partBNumber = GetDictString(weld, "PartB_Number")
+
+        row(0) = WeldDisplayId(weld)
+        row(1) = JoinPair(PositionForPartNumber(partANumber, bomMaps), _
+                          PositionForPartNumber(partBNumber, bomMaps))
+        row(2) = FormatThicknessPair(ThicknessForPart(weld, "PartA", partANumber, bomMaps, modelDoc), _
+                                     ThicknessForPart(weld, "PartB", partBNumber, bomMaps, modelDoc))
+        row(3) = JoinPairDistinct(MaterialForPart(weld, "PartA", partANumber, bomMaps, modelDoc), _
+                                  MaterialForPart(weld, "PartB", partBNumber, bomMaps, modelDoc))
+        row(4) = GetDictString(weld, "WPS")
+        row(5) = GetDictString(weld, "WeldingProcess")
+        row(6) = FillerDisplay(weld)
+
+        ListAdd rows, row
+    Next
+
+    Set BuildSimpleWeldJointRows = rows
+End Function
+
+Function WeldDisplayId(weld)
+    Dim weldId
+    weldId = Trim(GetDictString(weld, "WeldID"))
+
+    If weldId = "" Then weldId = PrefixToWeldId(GetDictString(weld, "_Prefix"))
+    If weldId = "" Then weldId = GetDictString(weld, "_Prefix")
+
+    WeldDisplayId = NormalizeWeldId(weldId)
+    If WeldDisplayId = "" Then WeldDisplayId = weldId
+End Function
+
+Function PositionForPartNumber(partNumber, bomMaps)
+    PositionForPartNumber = BomLookup(bomMaps, "PositionByPartNumber", partNumber)
+    If Trim(PositionForPartNumber) = "" Then PositionForPartNumber = Trim(CStr(partNumber))
+End Function
+
+Function MaterialForPart(weld, partPrefix, partNumber, bomMaps, modelDoc)
+    Dim value
+    value = Trim(GetDictString(weld, CStr(partPrefix) & "_Material"))
+
+    If value = "" Then value = ModelPropertyForPartNumber(modelDoc, partNumber, Array("MS_Material", "Material"))
+    If value = "" Then value = BomLookup(bomMaps, "MaterialByPartNumber", partNumber)
+
+    MaterialForPart = value
+End Function
+
+Function ThicknessForPart(weld, partPrefix, partNumber, bomMaps, modelDoc)
+    Dim value
+    value = Trim(GetDictString(weld, CStr(partPrefix) & "_Thickness"))
+
+    If value = "" Then value = ModelPropertyForPartNumber(modelDoc, partNumber, Array("MS_Thickness", "Thickness"))
+    If value = "" Then value = BomLookup(bomMaps, "ThicknessByPartNumber", partNumber)
+
+    ThicknessForPart = ExtractThicknessValue(value)
+End Function
+
+Function FillerDisplay(weld)
+    Dim parts
+    Set parts = NewList()
+
+    Dim tradeName
+    Dim designation
+    Dim diameter
+
+    tradeName = Trim(GetDictString(weld, "FillerTradeName"))
+    designation = Trim(GetDictString(weld, "FillerDesignation"))
+    diameter = CleanDiameterValue(GetDictString(weld, "FillerDiameter"))
+
+    If tradeName <> "" Then ListAdd parts, tradeName
+    If designation <> "" Then
+        If UCase(designation) <> UCase(tradeName) Then ListAdd parts, designation
+    End If
+    If diameter <> "" Then ListAdd parts, DiameterSymbol() & diameter
+
+    FillerDisplay = JoinList(parts, " / ")
+End Function
+
+Function BuildMaterialConsumptionRowsWithSummary(welds, sortedKeys)
+    Dim rows
+    Set rows = NewList()
+
+    Dim groups
+    Set groups = BuildFillerGroups(welds, sortedKeys)
+
+    Dim totalLengthM
+    Dim totalFillerKg
+    Dim totalGasLiters
+    Dim totalGasBottles
+    totalLengthM = 0.0
+    totalFillerKg = 0.0
+    totalGasLiters = 0.0
+    totalGasBottles = 0.0
+
+    Dim key
+    Dim g
+    Dim row
+
+    For Each key In groups.Keys
+        Set g = groups.Item(key)
+        row = Array("", "", "", "", "", "", "", "")
+
+        row(0) = GetDictString(g, "Process")
+        row(1) = GetDictString(g, "TradeName")
+        row(2) = GetDictString(g, "Designation")
+        row(3) = CleanDiameterValue(GetDictString(g, "Diameter"))
+        row(4) = Fmt2(ToDouble(GetDictString(g, "Length_m")))
+        row(5) = Fmt2(ToDouble(GetDictString(g, "Filler_kg")))
+        row(6) = Fmt0(ToDouble(GetDictString(g, "Gas_L")))
+        row(7) = Fmt2(ToDouble(GetDictString(g, "Gas_Bottles")))
+        ListAdd rows, row
+
+        totalLengthM = totalLengthM + ToDouble(GetDictString(g, "Length_m"))
+        totalFillerKg = totalFillerKg + ToDouble(GetDictString(g, "Filler_kg"))
+        totalGasLiters = totalGasLiters + ToDouble(GetDictString(g, "Gas_L"))
+        totalGasBottles = totalGasBottles + ToDouble(GetDictString(g, "Gas_Bottles"))
+    Next
+
+    Call AddBlankMaterialConsumptionRow(rows)
+    Call AddMaterialConsumptionSummaryRow(rows, SummaryTitleText(), "")
+    Call AddMaterialConsumptionSummaryRow(rows, "Ukupna du" & ChrW(382) & "ina zavara:", Fmt2(totalLengthM) & " m")
+    Call AddMaterialConsumptionSummaryRow(rows, "Ukupna procenjena potro" & ChrW(353) & "nja dodatnog materijala:", Fmt2(totalFillerKg) & " kg")
+    Call AddMaterialConsumptionSummaryRow(rows, "Ukupna procenjena potro" & ChrW(353) & "nja za" & ChrW(353) & "titnog gasa:", Fmt0(totalGasLiters) & " L")
+    Call AddMaterialConsumptionSummaryRow(rows, "Ukupna procenjena potro" & ChrW(353) & "nja za" & ChrW(353) & "titnog gasa:", _
+                                         Fmt2(totalGasBottles) & " boca 40L/200bar")
+
+    Set BuildMaterialConsumptionRowsWithSummary = rows
+End Function
+
+Sub AddBlankMaterialConsumptionRow(rows)
+    Dim row(7)
+    ListAdd rows, row
+End Sub
+
+Sub AddMaterialConsumptionSummaryRow(rows, labelText, valueText)
+    Dim row(7)
+    row(0) = CStr(labelText)
+    row(1) = CStr(valueText)
+    ListAdd rows, row
+End Sub
+
+Function BuildBomMapsFromDrawing(sheet)
+    Dim maps
+    Set maps = CreateObject("Scripting.Dictionary")
+    maps.CompareMode = 1
+
+    maps.Add "PositionByPartNumber", CreateTextDictionary()
+    maps.Add "MaterialByPartNumber", CreateTextDictionary()
+    maps.Add "ThicknessByPartNumber", CreateTextDictionary()
+
+    If sheet Is Nothing Then
+        Set BuildBomMapsFromDrawing = maps
+        Exit Function
+    End If
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then
+        Set BuildBomMapsFromDrawing = maps
+        Exit Function
+    End If
+
+    Dim i
+    Dim j
+    Dim view
+    Dim tables
+    Dim table
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        Set tables = Nothing
+
+        On Error Resume Next
+        Set view = views.Item(i)
+        If Not view Is Nothing Then Set tables = view.Tables
+        On Error GoTo 0
+
+        If Not tables Is Nothing Then
+            For j = 1 To CollectionCount(tables)
+                Set table = Nothing
+                On Error Resume Next
+                Set table = tables.Item(j)
+                On Error GoTo 0
+
+                If Not table Is Nothing Then Call ReadBomTableIntoMaps(table, maps)
+            Next
+        End If
+    Next
+
+    Set BuildBomMapsFromDrawing = maps
+End Function
+
+Sub ReadBomTableIntoMaps(table, bomMaps)
+    Dim rowCount
+    Dim colCount
+    rowCount = DrawingTableRowCount(table)
+    colCount = DrawingTableColumnCount(table)
+
+    If rowCount <= 0 Or colCount <= 0 Then Exit Sub
+
+    Dim headerRow
+    Dim maxHeaderRow
+    Dim posCol
+    Dim partNoCol
+    Dim matCol
+    Dim thickCol
+
+    maxHeaderRow = rowCount
+    If maxHeaderRow > 5 Then maxHeaderRow = 5
+
+    For headerRow = 1 To maxHeaderRow
+        posCol = FindBomHeaderColumn(table, headerRow, colCount, "POSITION")
+        partNoCol = FindBomHeaderColumn(table, headerRow, colCount, "PARTNUMBER")
+
+        If posCol > 0 And partNoCol > 0 Then
+            matCol = FindBomHeaderColumn(table, headerRow, colCount, "MATERIAL")
+            thickCol = FindBomHeaderColumn(table, headerRow, colCount, "THICKNESS")
+            Call ReadBomRows(table, bomMaps, headerRow + 1, rowCount, posCol, partNoCol, matCol, thickCol)
+            Exit Sub
+        End If
+    Next
+End Sub
+
+Sub ReadBomRows(table, bomMaps, firstRow, lastRow, posCol, partNoCol, matCol, thickCol)
+    Dim r
+    Dim partNumber
+    Dim position
+    Dim material
+    Dim thickness
+
+    For r = firstRow To lastRow
+        partNumber = Trim(DrawingTableCellText(table, r, partNoCol))
+        If partNumber <> "" Then
+            position = Trim(DrawingTableCellText(table, r, posCol))
+            If matCol > 0 Then material = Trim(DrawingTableCellText(table, r, matCol)) Else material = ""
+            If thickCol > 0 Then thickness = Trim(DrawingTableCellText(table, r, thickCol)) Else thickness = ""
+
+            Call PutBomValue(bomMaps.Item("PositionByPartNumber"), partNumber, position)
+            Call PutBomValue(bomMaps.Item("MaterialByPartNumber"), partNumber, material)
+            Call PutBomValue(bomMaps.Item("ThicknessByPartNumber"), partNumber, thickness)
+        End If
+    Next
+End Sub
+
+Function FindBomHeaderColumn(table, headerRow, colCount, headerKind)
+    FindBomHeaderColumn = 0
+
+    Dim c
+    Dim value
+    For c = 1 To colCount
+        value = NormalizeBomHeader(DrawingTableCellText(table, headerRow, c))
+
+        Select Case CStr(headerKind)
+            Case "POSITION"
+                If IsBomPositionHeader(value) Then
+                    FindBomHeaderColumn = c
+                    Exit Function
+                End If
+            Case "PARTNUMBER"
+                If IsBomPartNumberHeader(value) Then
+                    FindBomHeaderColumn = c
+                    Exit Function
+                End If
+            Case "MATERIAL"
+                If IsBomMaterialHeader(value) Then
+                    FindBomHeaderColumn = c
+                    Exit Function
+                End If
+            Case "THICKNESS"
+                If IsBomThicknessHeader(value) Then
+                    FindBomHeaderColumn = c
+                    Exit Function
+                End If
+        End Select
+    Next
+End Function
+
+Function IsBomPositionHeader(value)
+    IsBomPositionHeader = (value = "POZ" Or value = "POSITION" Or _
+                           value = "ITEM" Or value = "ITEMNO" Or _
+                           value = "ITEMNUMBER" Or InStr(value, "POZICIJA") > 0)
+End Function
+
+Function IsBomPartNumberHeader(value)
+    IsBomPartNumberHeader = (InStr(value, "BROJCRTEZA") > 0 Or _
+                             InStr(value, "DRAWINGNO") > 0 Or _
+                             InStr(value, "PARTNUMBER") > 0 Or _
+                             value = "PARTNO" Or value = "NUMBER")
+End Function
+
+Function IsBomMaterialHeader(value)
+    IsBomMaterialHeader = (InStr(value, "MATERIJAL") > 0 Or InStr(value, "MATERIAL") > 0)
+End Function
+
+Function IsBomThicknessHeader(value)
+    IsBomThicknessHeader = (InStr(value, "DIMENZIJA") > 0 Or _
+                            InStr(value, "DIMENSION") > 0 Or _
+                            InStr(value, "DEBLJINA") > 0 Or _
+                            InStr(value, "THICKNESS") > 0)
+End Function
+
+Function DrawingTableRowCount(table)
+    DrawingTableRowCount = 0
+    On Error Resume Next
+    Err.Clear
+    DrawingTableRowCount = CLng(table.NumberOfRows)
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableRowCount = CLng(table.GetNumberOfRows)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableRowCount = CLng(table.RowCount)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableRowCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function DrawingTableColumnCount(table)
+    DrawingTableColumnCount = 0
+    On Error Resume Next
+    Err.Clear
+    DrawingTableColumnCount = CLng(table.NumberOfColumns)
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableColumnCount = CLng(table.GetNumberOfColumns)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableColumnCount = CLng(table.ColumnCount)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableColumnCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function DrawingTableCellText(table, rowIndex, colIndex)
+    DrawingTableCellText = ""
+    On Error Resume Next
+    Err.Clear
+    DrawingTableCellText = CStr(table.GetCellString(CLng(rowIndex), CLng(colIndex)))
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableCellText = CStr(table.GetCellObject(CLng(rowIndex), CLng(colIndex)).Text)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        DrawingTableCellText = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function CreateTextDictionary()
+    Dim dict
+    Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = 1
+    Set CreateTextDictionary = dict
+End Function
+
+Sub PutBomValue(dict, partNumber, value)
+    Dim key
+    key = PartNumberKey(partNumber)
+
+    If key = "" Or Trim(CStr(value)) = "" Then Exit Sub
+
+    If Not dict.Exists(key) Then
+        dict.Add key, Trim(CStr(value))
+    End If
+End Sub
+
+Function BomLookup(bomMaps, mapName, partNumber)
+    BomLookup = ""
+
+    If bomMaps Is Nothing Then Exit Function
+    If Not bomMaps.Exists(CStr(mapName)) Then Exit Function
+
+    Dim dict
+    Set dict = bomMaps.Item(CStr(mapName))
+
+    Dim key
+    key = PartNumberKey(partNumber)
+    If key = "" Then Exit Function
+
+    If dict.Exists(key) Then BomLookup = CStr(dict.Item(key))
+End Function
+
+Function PartNumberKey(partNumber)
+    PartNumberKey = UCase(Trim(CStr(partNumber)))
+    PartNumberKey = Replace(PartNumberKey, " ", "")
+End Function
+
+Function NormalizeBomHeader(value)
+    Dim s
+    s = UCase(Trim(CStr(value)))
+
+    s = Replace(s, ChrW(268), "C")
+    s = Replace(s, ChrW(262), "C")
+    s = Replace(s, ChrW(352), "S")
+    s = Replace(s, ChrW(381), "Z")
+    s = Replace(s, ChrW(272), "DJ")
+    s = Replace(s, ChrW(269), "C")
+    s = Replace(s, ChrW(263), "C")
+    s = Replace(s, ChrW(353), "S")
+    s = Replace(s, ChrW(382), "Z")
+    s = Replace(s, ChrW(273), "DJ")
+
+    s = Replace(s, " ", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, ":", "")
+
+    NormalizeBomHeader = s
+End Function
+
+Function ModelPropertyForPartNumber(modelDoc, partNumber, propertyNames)
+    ModelPropertyForPartNumber = ""
+
+    If modelDoc Is Nothing Then Exit Function
+    If Trim(CStr(partNumber)) = "" Then Exit Function
+
+    If IsProductDocument(modelDoc) Then
+        ModelPropertyForPartNumber = SearchProductPropertyForPartNumber(modelDoc.Product, partNumber, propertyNames)
+        Exit Function
+    End If
+
+    If IsPartDocument(modelDoc) Then
+        If PartDocumentMatchesPartNumber(modelDoc, partNumber) Then
+            ModelPropertyForPartNumber = PropertyFromDocument(modelDoc, propertyNames)
+        End If
+    End If
+End Function
+
+Function SearchProductPropertyForPartNumber(product, partNumber, propertyNames)
+    SearchProductPropertyForPartNumber = ""
+    If product Is Nothing Then Exit Function
+
+    If ProductMatchesPartNumber(product, partNumber) Then
+        SearchProductPropertyForPartNumber = PropertyFromProduct(product, propertyNames)
+        If SearchProductPropertyForPartNumber <> "" Then Exit Function
+
+        Dim doc
+        Set doc = ProductToDocument(product)
+        If Not doc Is Nothing Then
+            SearchProductPropertyForPartNumber = PropertyFromDocument(doc, propertyNames)
+            If SearchProductPropertyForPartNumber <> "" Then Exit Function
+        End If
+    End If
+
+    Dim children
+    Dim child
+    Dim i
+    Dim found
+
+    On Error Resume Next
+    Set children = product.Products
+    On Error GoTo 0
+
+    If children Is Nothing Then Exit Function
+
+    For i = 1 To children.Count
+        Set child = Nothing
+        On Error Resume Next
+        Set child = children.Item(i)
+        On Error GoTo 0
+
+        If Not child Is Nothing Then
+            found = SearchProductPropertyForPartNumber(child, partNumber, propertyNames)
+            If found <> "" Then
+                SearchProductPropertyForPartNumber = found
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Function ProductMatchesPartNumber(product, partNumber)
+    ProductMatchesPartNumber = False
+    If product Is Nothing Then Exit Function
+
+    Dim pn
+    Dim nm
+    pn = ""
+    nm = ""
+
+    On Error Resume Next
+    pn = CStr(product.PartNumber)
+    nm = CStr(product.Name)
+    On Error GoTo 0
+
+    ProductMatchesPartNumber = (PartNumberKey(pn) = PartNumberKey(partNumber) Or _
+                                PartNumberKey(nm) = PartNumberKey(partNumber))
+End Function
+
+Function PartDocumentMatchesPartNumber(partDoc, partNumber)
+    PartDocumentMatchesPartNumber = False
+
+    Dim pn
+    Dim nm
+    pn = ""
+    nm = ""
+
+    On Error Resume Next
+    pn = CStr(partDoc.Product.PartNumber)
+    nm = CStr(partDoc.Name)
+    On Error GoTo 0
+
+    PartDocumentMatchesPartNumber = (PartNumberKey(pn) = PartNumberKey(partNumber) Or _
+                                     PartNumberKey(nm) = PartNumberKey(partNumber))
+End Function
+
+Function PropertyFromProduct(product, propertyNames)
+    PropertyFromProduct = ""
+
+    Dim i
+    For i = LBound(propertyNames) To UBound(propertyNames)
+        PropertyFromProduct = ProductPropertyValue(product, CStr(propertyNames(i)))
+        If Trim(PropertyFromProduct) <> "" Then Exit Function
+    Next
+End Function
+
+Function ProductPropertyValue(product, propertyName)
+    ProductPropertyValue = ""
+
+    On Error Resume Next
+    Err.Clear
+    ProductPropertyValue = CStr(product.UserRefProperties.Item(CStr(propertyName)).ValueAsString)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ProductPropertyValue = CStr(product.UserRefProperties.Item(CStr(propertyName)).Value)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ProductPropertyValue = CStr(product.Parameters.Item(CStr(propertyName)).ValueAsString)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ProductPropertyValue = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function PropertyFromDocument(doc, propertyNames)
+    PropertyFromDocument = ""
+
+    Dim i
+    For i = LBound(propertyNames) To UBound(propertyNames)
+        PropertyFromDocument = DocumentPropertyValue(doc, CStr(propertyNames(i)))
+        If Trim(PropertyFromDocument) <> "" Then Exit Function
+    Next
+End Function
+
+Function DocumentPropertyValue(doc, propertyName)
+    DocumentPropertyValue = ""
+
+    On Error Resume Next
+    Err.Clear
+    If IsPartDocument(doc) Then DocumentPropertyValue = CStr(doc.Part.Parameters.Item(CStr(propertyName)).ValueAsString)
+    If Err.Number <> 0 Then
+        Err.Clear
+        DocumentPropertyValue = CStr(doc.Product.UserRefProperties.Item(CStr(propertyName)).ValueAsString)
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        DocumentPropertyValue = ""
+    End If
+    On Error GoTo 0
+End Function
+
+Function JoinPair(valueA, valueB)
+    valueA = Trim(CStr(valueA))
+    valueB = Trim(CStr(valueB))
+
+    If valueA <> "" And valueB <> "" Then
+        If UCase(valueA) = UCase(valueB) Then
+            JoinPair = valueA
+        Else
+            JoinPair = valueA & " / " & valueB
+        End If
+    ElseIf valueA <> "" Then
+        JoinPair = valueA
+    Else
+        JoinPair = valueB
+    End If
+End Function
+
+Function JoinPairDistinct(valueA, valueB)
+    JoinPairDistinct = JoinPair(valueA, valueB)
+End Function
+
+Function FormatThicknessPair(valueA, valueB)
+    Dim joined
+    joined = JoinPair(valueA, valueB)
+
+    If Trim(joined) = "" Then
+        FormatThicknessPair = ""
+    Else
+        FormatThicknessPair = joined & " mm"
+    End If
+End Function
+
+Function ExtractThicknessValue(value)
+    ExtractThicknessValue = ""
+
+    Dim s
+    s = UCase(Trim(CStr(value)))
+    If s = "" Then Exit Function
+
+    s = Replace(s, ",", ".")
+    s = Replace(s, ChrW(216), "D")
+    s = Replace(s, "FI", "D")
+    s = Replace(s, "*", "X")
+    s = Replace(s, " MM", "")
+    s = Replace(s, "MM", "")
+
+    Dim re
+    Dim matches
+    Dim m
+    Dim numberValue
+    Dim bestValue
+    Dim hasValue
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.IgnoreCase = True
+    re.Global = True
+    re.Pattern = "[0-9]+([.][0-9]+)?"
+
+    Set matches = re.Execute(s)
+    hasValue = False
+    bestValue = 0.0
+
+    For Each m In matches
+        numberValue = ToDouble(CStr(m.Value))
+        If numberValue > 0.0 Then
+            If Not hasValue Or numberValue < bestValue Then
+                bestValue = numberValue
+                hasValue = True
+            End If
+        End If
+    Next
+
+    If hasValue Then ExtractThicknessValue = FmtCompact(bestValue)
+End Function
+
+Function CleanDiameterValue(value)
+    Dim s
+    s = Trim(CStr(value))
+    If s = "" Then
+        CleanDiameterValue = ""
+        Exit Function
+    End If
+
+    s = Replace(s, ChrW(216), "")
+    s = Replace(s, "FI", "", 1, -1, 1)
+    s = Replace(s, "mm", "", 1, -1, 1)
+    s = Replace(s, "MM", "")
+    s = Trim(s)
+
+    CleanDiameterValue = s
+End Function
+
+Function FmtCompact(value)
+    Dim s
+    s = Fmt2(CDbl(value))
+
+    Do While InStr(s, ".") > 0 And Right(s, 1) = "0"
+        s = Left(s, Len(s) - 1)
+    Loop
+
+    If Right(s, 1) = "." Then s = Left(s, Len(s) - 1)
+
+    FmtCompact = s
+End Function
+
+Function JoinList(list, delimiter)
+    Dim s
+    Dim i
+    s = ""
+
+    For i = 0 To list.Count - 1
+        If s <> "" Then s = s & CStr(delimiter)
+        s = s & CStr(list.Item(CStr(i)))
+    Next
+
+    JoinList = s
+End Function
+
+Function GetSelectedColumnKeys(tableChoice)
+    Dim keys
+    Set keys = NewList()
+
+    Select Case Trim(CStr(tableChoice))
+        Case "3"
+            AddColumnKeys keys, Array("WeldID", "PartA", "PartB", "WeldType", _
+                                      "BaseMaterial", "MaterialDimensionThickness", _
+                                      "SizeGroove", "GrooveAngle", "WeldLength_mm", _
+                                      "WPS", "VT", "PT", "UT", "Remark")
+        Case "4"
+            AddColumnKeys keys, AllColumnKeys()
+        Case "5"
+            Set keys = AskCustomColumnKeys()
+        Case Else
+            AddColumnKeys keys, Array("WeldID", "PartA", "PartB", "WeldType", _
+                                      "BaseMaterial", "MaterialDimensionThickness", _
+                                      "SizeGroove", "GrooveAngle", "WeldLength_mm", _
+                                      "WPS", "WeldingProcess", "FillerTradeName", _
+                                      "FillerDiameter", "Remark")
+    End Select
+
+    Set GetSelectedColumnKeys = keys
+End Function
+
+Sub AddColumnKeys(keys, arrayValue)
+    Dim i
+    For i = LBound(arrayValue) To UBound(arrayValue)
+        ListAdd keys, CStr(arrayValue(i))
+    Next
+End Sub
+
+Function AskCustomColumnKeys()
+    Dim keys
+    Set keys = NewList()
+
+    Dim msg
+    msg = "Custom selection / Rucni izbor kolona:" & vbCrLf & vbCrLf & _
+          "1 Weld ID" & vbCrLf & _
+          "2 Part A" & vbCrLf & _
+          "3 Part B" & vbCrLf & _
+          "4 Osnovni materijal" & vbCrLf & _
+          "5 Dimenzija materijala / debljina" & vbCrLf & _
+          "6 Weld Type" & vbCrLf & _
+          "7 Size / Groove" & vbCrLf & _
+          "8 Groove Angle" & vbCrLf & _
+          "9 Root Gap" & vbCrLf & _
+          "10 Root Face" & vbCrLf & _
+          "11 Number of Passes" & vbCrLf & _
+          "12 Weld Length [mm]" & vbCrLf & _
+          "13 Weld Length [m]" & vbCrLf & _
+          "14 WPS" & vbCrLf & _
+          "15 Welding Process" & vbCrLf & _
+          "16 Filler Type" & vbCrLf & _
+          "17 Filler Trade Name" & vbCrLf & _
+          "18 Filler Designation" & vbCrLf & _
+          "19 Filler Diameter" & vbCrLf & _
+          "20 Estimated Filler [kg]" & vbCrLf & _
+          "21 Procena gasa [L]" & vbCrLf & _
+          "22 Procena gasa [boce 40L/200bar]" & vbCrLf & _
+          "23 VT %" & vbCrLf & _
+          "24 PT %" & vbCrLf & _
+          "25 UT %" & vbCrLf & _
+          "26 Remark" & vbCrLf & vbCrLf & _
+          "Example: 1,2,3,4,5,6,7,12,14,15,17,19,23,24,25"
+
+    Dim inputValue
+    inputValue = AskString(msg, "1,2,3,4,5,6,7,12,14,15,17,19,23,24,25")
+
+    If Trim(inputValue) = "" Then
+        AddColumnKeys keys, Array("WeldID", "PartA", "PartB", "WeldType", _
+                                  "SizeGroove", "WeldLength_mm", "WPS")
+        Set AskCustomColumnKeys = keys
+        Exit Function
+    End If
+
+    Dim tokens
+    Dim token
+    Dim numberValue
+    Dim allKeys
+    Dim added
+
+    inputValue = Replace(inputValue, ";", ",")
+    inputValue = Replace(inputValue, " ", ",")
+    tokens = Split(inputValue, ",")
+    allKeys = AllColumnKeys()
+    Set added = CreateObject("Scripting.Dictionary")
+
+    For Each token In tokens
+        token = Trim(CStr(token))
+        If token <> "" Then
+            If IsNumeric(token) Then
+                numberValue = CLng(token)
+                If numberValue >= 1 And numberValue <= 26 Then
+                    If Not added.Exists(CStr(numberValue)) Then
+                        ListAdd keys, CStr(allKeys(numberValue - 1))
+                        added.Add CStr(numberValue), True
+                    End If
+                End If
+            End If
+        End If
+    Next
+
+    If keys.Count = 0 Then
+        AddColumnKeys keys, Array("WeldID", "PartA", "PartB", "WeldType", _
+                                  "SizeGroove", "WeldLength_mm", "WPS")
+    End If
+
+    Set AskCustomColumnKeys = keys
+End Function
+
+Function WeldTableTitle(tableChoice)
+    Select Case Trim(CStr(tableChoice))
+        Case "3"
+            WeldTableTitle = "QA/QC TABELA ZAVARA / QA/QC WELD TABLE"
+        Case "4", "5"
+            WeldTableTitle = "TABELA ZAVARA / WELD TABLE"
+        Case Else
+            WeldTableTitle = "OPERATIVNA TABELA ZAVARA / OPERATIONAL WELD TABLE"
+    End Select
+End Function
+
+Function AllColumnKeys()
+    AllColumnKeys = Array( _
+        "WeldID", _
+        "PartA", _
+        "PartB", _
+        "BaseMaterial", _
+        "MaterialDimensionThickness", _
+        "WeldType", _
+        "SizeGroove", _
+        "GrooveAngle", _
+        "RootGap", _
+        "RootFace", _
+        "NumberOfPasses", _
+        "WeldLength_mm", _
+        "WeldLength_m", _
+        "WPS", _
+        "WeldingProcess", _
+        "FillerType", _
+        "FillerTradeName", _
+        "FillerDesignation", _
+        "FillerDiameter", _
+        "EstimatedFiller", _
+        "EstimatedGasLiters", _
+        "EstimatedGasBottles", _
+        "VT", _
+        "PT", _
+        "UT", _
+        "Remark")
+End Function
+
+Function HeadersForColumnKeys(columnKeys)
+    Dim headers()
+    Dim i
+    ReDim headers(columnKeys.Count - 1)
+
+    For i = 0 To columnKeys.Count - 1
+        headers(i) = HeaderForColumnKey(CStr(columnKeys.Item(CStr(i))))
+    Next
+
+    HeadersForColumnKeys = headers
+End Function
+
+Function HeaderForColumnKey(columnKey)
+    Select Case CStr(columnKey)
+        Case "WeldID": HeaderForColumnKey = "Weld ID"
+        Case "PartA": HeaderForColumnKey = "Part A"
+        Case "PartB": HeaderForColumnKey = "Part B"
+        Case "BaseMaterial": HeaderForColumnKey = "Osnovni materijal"
+        Case "MaterialDimensionThickness": HeaderForColumnKey = "Dimenzija materijala / debljina"
+        Case "WeldType": HeaderForColumnKey = "Weld Type"
+        Case "SizeGroove": HeaderForColumnKey = "Size / Groove"
+        Case "GrooveAngle": HeaderForColumnKey = "Groove Angle"
+        Case "RootGap": HeaderForColumnKey = "Root Gap"
+        Case "RootFace": HeaderForColumnKey = "Root Face"
+        Case "NumberOfPasses": HeaderForColumnKey = "Number of Passes"
+        Case "WeldLength_mm": HeaderForColumnKey = "Weld Length [mm]"
+        Case "WeldLength_m": HeaderForColumnKey = "Weld Length [m]"
+        Case "WPS": HeaderForColumnKey = "WPS"
+        Case "WeldingProcess": HeaderForColumnKey = "Welding Process"
+        Case "FillerType": HeaderForColumnKey = "Filler Type"
+        Case "FillerTradeName": HeaderForColumnKey = "Filler Trade Name"
+        Case "FillerDesignation": HeaderForColumnKey = "Filler Designation"
+        Case "FillerDiameter": HeaderForColumnKey = "Filler Diameter"
+        Case "EstimatedFiller": HeaderForColumnKey = "Estimated Filler [kg]"
+        Case "EstimatedGasLiters": HeaderForColumnKey = "Procena gasa [L]"
+        Case "EstimatedGasBottles": HeaderForColumnKey = "Procena gasa [boce 40L/200bar]"
+        Case "VT": HeaderForColumnKey = "VT %"
+        Case "PT": HeaderForColumnKey = "PT %"
+        Case "UT": HeaderForColumnKey = "UT %"
+        Case "Remark": HeaderForColumnKey = "Remark"
+        Case Else: HeaderForColumnKey = CStr(columnKey)
+    End Select
+End Function
+
+Function CommercialHeaders()
+    CommercialHeaders = Array("Welding Process", _
+                              "Filler Trade Name", _
+                              "Filler Designation", _
+                              "Filler Diameter", _
+                              "Total Weld Length [m]", _
+                              "Estimated Filler [kg]", _
+                              "Procena gasa [L]", _
+                              "Procena gasa [boce 40L/200bar]")
+End Function
+
+Function BuildWeldRows(welds, sortedKeys, columnKeys)
+    Dim rows
+    Set rows = NewList()
+
+    Dim i
+    Dim c
+    Dim row()
+    Dim weld
+
+    For i = LBound(sortedKeys) To UBound(sortedKeys)
+        Set weld = welds.Item(CStr(sortedKeys(i)))
+        ReDim row(columnKeys.Count - 1)
+
+        For c = 0 To columnKeys.Count - 1
+            row(c) = GetColumnValue(weld, CStr(columnKeys.Item(CStr(c))))
+        Next
+
+        ListAdd rows, row
+    Next
+
+    Set BuildWeldRows = rows
+End Function
+
+Function GetColumnValue(weld, columnKey)
+    Select Case CStr(columnKey)
+        Case "WeldID"
+            GetColumnValue = GetDictString(weld, "WeldID")
+        Case "PartA"
+            GetColumnValue = JoinPart(GetDictString(weld, "PartA_Number"), GetDictString(weld, "PartA_Name"))
+        Case "PartB"
+            GetColumnValue = JoinPart(GetDictString(weld, "PartB_Number"), GetDictString(weld, "PartB_Name"))
+        Case "BaseMaterial"
+            GetColumnValue = JoinDistinct(GetDictString(weld, "PartA_Material"), GetDictString(weld, "PartB_Material"))
+        Case "MaterialDimensionThickness"
+            GetColumnValue = JoinMaterialDimensions(weld)
+        Case "WeldType"
+            GetColumnValue = GetDictString(weld, "WeldType")
+        Case "SizeGroove"
+            GetColumnValue = SizeGrooveValue(weld)
+        Case "GrooveAngle"
+            GetColumnValue = GrooveAngleValue(weld)
+        Case "RootGap"
+            GetColumnValue = GetDictString(weld, "RootGap_mm")
+        Case "RootFace"
+            GetColumnValue = GetDictString(weld, "RootFace_mm")
+        Case "NumberOfPasses"
+            GetColumnValue = GetDictString(weld, "NumberOfPasses")
+        Case "WeldLength_mm"
+            GetColumnValue = GetDictString(weld, "WeldLength_mm")
+        Case "WeldLength_m"
+            GetColumnValue = GetDictString(weld, "WeldLength_m")
+        Case "WPS"
+            GetColumnValue = GetDictString(weld, "WPS")
+        Case "WeldingProcess"
+            GetColumnValue = GetDictString(weld, "WeldingProcess")
+        Case "FillerType"
+            GetColumnValue = GetDictString(weld, "FillerType")
+        Case "FillerTradeName"
+            GetColumnValue = GetDictString(weld, "FillerTradeName")
+        Case "FillerDesignation"
+            GetColumnValue = GetDictString(weld, "FillerDesignation")
+        Case "FillerDiameter"
+            GetColumnValue = GetDictString(weld, "FillerDiameter")
+        Case "EstimatedFiller"
+            GetColumnValue = GetDictString(weld, "EstimatedFillerConsumption_kg")
+        Case "EstimatedGasLiters"
+            GetColumnValue = Fmt2(GasLitersForWeld(weld))
+        Case "EstimatedGasBottles"
+            GetColumnValue = Fmt2(GasBottlesForWeld(weld))
+        Case "VT"
+            GetColumnValue = PercentValue(GetDictString(weld, "VT"))
+        Case "PT"
+            GetColumnValue = PercentValue(GetDictString(weld, "PT"))
+        Case "UT"
+            GetColumnValue = PercentValue(GetDictString(weld, "UT"))
+        Case "Remark"
+            GetColumnValue = GetDictString(weld, "Remark")
+        Case Else
+            GetColumnValue = ""
+    End Select
+End Function
+
+Function SizeGrooveValue(weld)
+    Dim weldType
+    Dim value
+
+    weldType = UCase(GetDictString(weld, "WeldType"))
+
+    If IsButtWeldType(weldType) Then
+        value = Trim(GetDictString(weld, "GrooveDepth"))
+        If value <> "" Then
+            If Left(UCase(value), 1) <> "S" Then value = "S" & value
+        End If
+        SizeGrooveValue = value
+    Else
+        SizeGrooveValue = GetDictString(weld, "WeldSize")
+    End If
+End Function
+
+Function GrooveAngleValue(weld)
+    Dim weldType
+    weldType = UCase(GetDictString(weld, "WeldType"))
+
+    If IsFilletWeldType(weldType) Then
+        GrooveAngleValue = ""
+    Else
+        GrooveAngleValue = GetDictString(weld, "GrooveAngle")
+    End If
+End Function
+
+Function IsFilletWeldType(weldType)
+    IsFilletWeldType = (InStr(weldType, "FW") > 0 Or InStr(weldType, "FILLET") > 0)
+End Function
+
+Function IsButtWeldType(weldType)
+    IsButtWeldType = (InStr(weldType, "BW") > 0 Or _
+                      InStr(weldType, "BUTT") > 0 Or _
+                      InStr(weldType, "GROOVE") > 0)
+End Function
+
+Function JoinPart(partNumber, partName)
+    partNumber = Trim(CStr(partNumber))
+    partName = Trim(CStr(partName))
+
+    If partNumber <> "" And partName <> "" Then
+        JoinPart = partNumber & " - " & partName
+    ElseIf partNumber <> "" Then
+        JoinPart = partNumber
+    Else
+        JoinPart = partName
+    End If
+End Function
+
+Function JoinDistinct(valueA, valueB)
+    valueA = Trim(CStr(valueA))
+    valueB = Trim(CStr(valueB))
+
+    If valueA <> "" And valueB <> "" Then
+        If UCase(valueA) = UCase(valueB) Then
+            JoinDistinct = valueA
+        Else
+            JoinDistinct = valueA & " / " & valueB
+        End If
+    ElseIf valueA <> "" Then
+        JoinDistinct = valueA
+    Else
+        JoinDistinct = valueB
+    End If
+End Function
+
+Function JoinMaterialDimensions(weld)
+    Dim a
+    Dim b
+
+    a = JoinPartDimension(GetDictString(weld, "PartA_Dimension"), GetDictString(weld, "PartA_Thickness"))
+    b = JoinPartDimension(GetDictString(weld, "PartB_Dimension"), GetDictString(weld, "PartB_Thickness"))
+
+    JoinMaterialDimensions = JoinDistinct(a, b)
+End Function
+
+Function JoinPartDimension(dimensionValue, thicknessValue)
+    dimensionValue = Trim(CStr(dimensionValue))
+    thicknessValue = Trim(CStr(thicknessValue))
+
+    If dimensionValue <> "" And thicknessValue <> "" Then
+        JoinPartDimension = dimensionValue & " / t=" & thicknessValue
+    ElseIf dimensionValue <> "" Then
+        JoinPartDimension = dimensionValue
+    ElseIf thicknessValue <> "" Then
+        JoinPartDimension = "t=" & thicknessValue
+    Else
+        JoinPartDimension = ""
+    End If
+End Function
+
+Function PercentValue(value)
+    value = Trim(CStr(value))
+    If value = "" Then
+        PercentValue = ""
+    ElseIf InStr(value, "%") > 0 Then
+        PercentValue = value
+    Else
+        PercentValue = value & "%"
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Summary and grouping
+' ---------------------------------------------------------------------------
+
+Function BuildCommercialRows(welds, sortedKeys)
+    Dim groups
+    Set groups = BuildFillerGroups(welds, sortedKeys)
+
+    Dim rows
+    Set rows = NewList()
+
+    Dim key
+    Dim g
+    Dim row
+
+    For Each key In groups.Keys
+        Set g = groups.Item(key)
+        row = Array("", "", "", "", "", "", "", "")
+
+        row(0) = GetDictString(g, "Process")
+        row(1) = GetDictString(g, "TradeName")
+        row(2) = GetDictString(g, "Designation")
+        row(3) = GetDictString(g, "Diameter")
+        row(4) = Fmt2(ToDouble(GetDictString(g, "Length_m")))
+        row(5) = Fmt2(ToDouble(GetDictString(g, "Filler_kg")))
+        row(6) = Fmt2(ToDouble(GetDictString(g, "Gas_L")))
+        row(7) = Fmt2(ToDouble(GetDictString(g, "Gas_Bottles")))
+
+        ListAdd rows, row
+    Next
+
+    Set BuildCommercialRows = rows
+End Function
+
+Function BuildFillerGroups(welds, sortedKeys)
+    Dim groups
+    Set groups = CreateObject("Scripting.Dictionary")
+    groups.CompareMode = 1
+
+    Dim i
+    Dim weld
+    Dim process
+    Dim tradeName
+    Dim designation
+    Dim diameter
+    Dim groupKey
+    Dim g
+    Dim lengthM
+    Dim fillerKg
+    Dim gasLiters
+    Dim gasBottles
+
+    For i = LBound(sortedKeys) To UBound(sortedKeys)
+        Set weld = welds.Item(CStr(sortedKeys(i)))
+
+        process = Trim(GetDictString(weld, "WeldingProcess"))
+        tradeName = Trim(GetDictString(weld, "FillerTradeName"))
+        designation = Trim(GetDictString(weld, "FillerDesignation"))
+        diameter = Trim(GetDictString(weld, "FillerDiameter"))
+
+        groupKey = UCase(process & "|" & tradeName & "|" & designation & "|" & diameter)
+
+        If Not groups.Exists(groupKey) Then
+            Set g = CreateObject("Scripting.Dictionary")
+            g.CompareMode = 1
+            g.Add "Process", process
+            g.Add "TradeName", tradeName
+            g.Add "Designation", designation
+            g.Add "Diameter", diameter
+            g.Add "Length_m", "0"
+            g.Add "Filler_kg", "0"
+            g.Add "Gas_L", "0"
+            g.Add "Gas_Bottles", "0"
+            groups.Add groupKey, g
+        End If
+
+        Set g = groups.Item(groupKey)
+
+        lengthM = WeldLengthM(weld)
+        fillerKg = ToDouble(GetDictString(weld, "EstimatedFillerConsumption_kg"))
+        gasLiters = GasLitersForWeld(weld)
+        gasBottles = GasBottlesForWeld(weld)
+
+        SetDictString g, "Length_m", CStr(ToDouble(GetDictString(g, "Length_m")) + lengthM)
+        SetDictString g, "Filler_kg", CStr(ToDouble(GetDictString(g, "Filler_kg")) + fillerKg)
+        SetDictString g, "Gas_L", CStr(ToDouble(GetDictString(g, "Gas_L")) + gasLiters)
+        SetDictString g, "Gas_Bottles", CStr(ToDouble(GetDictString(g, "Gas_Bottles")) + gasBottles)
+    Next
+
+    Set BuildFillerGroups = groups
+End Function
+
+Function BuildOverallSummaryRows(welds, sortedKeys)
+    Dim rows
+    Set rows = NewList()
+
+    Dim totalLengthM
+    Dim totalFillerKg
+    Dim totalGasLiters
+    Dim totalGasBottles
+    Dim i
+    Dim weld
+    Dim row1(1)
+    Dim row2(1)
+    Dim row3(1)
+    Dim row4(1)
+
+    totalLengthM = 0.0
+    totalFillerKg = 0.0
+    totalGasLiters = 0.0
+    totalGasBottles = 0.0
+
+    For i = LBound(sortedKeys) To UBound(sortedKeys)
+        Set weld = welds.Item(CStr(sortedKeys(i)))
+
+        totalLengthM = totalLengthM + WeldLengthM(weld)
+        totalFillerKg = totalFillerKg + ToDouble(GetDictString(weld, "EstimatedFillerConsumption_kg"))
+        totalGasLiters = totalGasLiters + GasLitersForWeld(weld)
+        totalGasBottles = totalGasBottles + GasBottlesForWeld(weld)
+    Next
+
+    row1(0) = "Ukupna duzina zavara [m]"
+    row1(1) = Fmt2(totalLengthM) & " m"
+    ListAdd rows, row1
+
+    row2(0) = "Ukupna procenjena potrosnja dodatnog materijala [kg]"
+    row2(1) = Fmt2(totalFillerKg) & " kg"
+    ListAdd rows, row2
+
+    row3(0) = "Ukupna procenjena potrosnja zastitnog gasa [L]"
+    row3(1) = Fmt2(totalGasLiters) & " L"
+    ListAdd rows, row3
+
+    row4(0) = "Ukupna procenjena potrosnja zastitnog gasa [boce 40L/200bar]"
+    row4(1) = Fmt2(totalGasBottles) & " boca 40L/200bar"
+    ListAdd rows, row4
+
+    Set BuildOverallSummaryRows = rows
+End Function
+
+Function WeldLengthM(weld)
+    Dim lengthM
+    Dim lengthMm
+
+    lengthM = ToDouble(GetDictString(weld, "WeldLength_m"))
+
+    If lengthM = 0.0 Then
+        lengthMm = ToDouble(GetDictString(weld, "WeldLength_mm"))
+        If lengthMm <> 0.0 Then lengthM = lengthMm / 1000.0
+    End If
+
+    WeldLengthM = lengthM
+End Function
+
+Function GasLitersForWeld(weld)
+    Dim process
+    Dim fillerKg
+    Dim existingLiters
+    Dim existingBottles
+
+    process = Trim(GetDictString(weld, "WeldingProcess"))
+
+    If process = "111" Then
+        GasLitersForWeld = 0.0
+        Exit Function
+    End If
+
+    If IsGasShieldedWeldingProcess(process) Then
+        fillerKg = ToDouble(GetDictString(weld, "EstimatedFillerConsumption_kg"))
+        GasLitersForWeld = fillerKg * 400.0
+        Exit Function
+    End If
+
+    existingLiters = ToDouble(GetDictString(weld, "EstimatedGasLiters"))
+    If existingLiters <> 0.0 Then
+        GasLitersForWeld = existingLiters
+        Exit Function
+    End If
+
+    existingBottles = ToDouble(GetDictString(weld, "EstimatedGasBottles_40L_200bar"))
+    If existingBottles = 0.0 Then existingBottles = ToDouble(GetDictString(weld, "EstimatedGasBottles_200bar"))
+
+    GasLitersForWeld = existingBottles * 8000.0
+End Function
+
+Function GasBottlesForWeld(weld)
+    GasBottlesForWeld = GasLitersForWeld(weld) / 8000.0
+End Function
+
+Function IsGasShieldedWeldingProcess(weldingProcess)
+    Select Case Trim(CStr(weldingProcess))
+        Case "131", "135", "136", "141"
+            IsGasShieldedWeldingProcess = True
+        Case Else
+            IsGasShieldedWeldingProcess = False
+    End Select
+End Function
+
+Function GasForWeld(weld)
+    GasForWeld = GasBottlesForWeld(weld)
+End Function
+
+' ---------------------------------------------------------------------------
+' Drawing table creation
+' ---------------------------------------------------------------------------
+
+Function CreateOrGetSheet(drawingDoc, sheetName)
+    Dim sheets
+    Dim sheet
+    Dim i
+
+    Set CreateOrGetSheet = Nothing
+
+    On Error Resume Next
+    Set sheets = drawingDoc.Sheets
+    On Error GoTo 0
+
+    If sheets Is Nothing Then Exit Function
+
+    For i = 1 To sheets.Count
+        Set sheet = Nothing
+        On Error Resume Next
+        Set sheet = sheets.Item(i)
+        On Error GoTo 0
+
+        If Not sheet Is Nothing Then
+            If UCase(CStr(sheet.Name)) = UCase(CStr(sheetName)) Then
+                Set CreateOrGetSheet = sheet
+                On Error Resume Next
+                sheet.Activate
+                On Error GoTo 0
+                Exit Function
+            End If
+        End If
+    Next
+
+    On Error Resume Next
+    Set sheet = sheets.Add(sheetName)
+    If sheet Is Nothing Then Set sheet = sheets.Add()
+    If Not sheet Is Nothing Then sheet.Name = sheetName
+    If Not sheet Is Nothing Then sheet.Activate
+    On Error GoTo 0
+
+    Set CreateOrGetSheet = sheet
+End Function
+
+Function AddDrawingTable(sheet, title, headers, rows, x, y)
+    AddDrawingTable = False
+
+    If sheet Is Nothing Then Exit Function
+
+    Dim view
+    Set view = GetTableView(sheet)
+
+    If view Is Nothing Then Exit Function
+
+    Dim rowCount
+    Dim colCount
+    Dim tables
+    Dim table
+    Dim r
+    Dim c
+    Dim row
+    Dim rowHeight
+
+    colCount = UBound(headers) - LBound(headers) + 1
+    rowCount = rows.Count + 1
+    rowHeight = 5.5
+
+    Set tables = Nothing
+    Set table = Nothing
+
+    On Error Resume Next
+    Set tables = view.Tables
+    Set table = tables.Add(CDbl(x), CDbl(y), rowCount, colCount, CDbl(rowHeight), 24.0)
+    If Err.Number <> 0 Or table Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        AddDrawingTable = AddTextTableFallback(view, title, headers, rows, x, y)
+        Exit Function
+    End If
+
+    Call AddTableTitleText(view, title, CDbl(x), CDbl(y) + 7.0)
+
+    table.Name = SafeTableName(title)
+
+    For c = 1 To colCount
+        table.SetCellString 1, c, CStr(headers(c - 1))
+        Call FormatTableCell(table, 1, c, 2.5, True)
+    Next
+
+    For r = 0 To rows.Count - 1
+        row = rows.Item(CStr(r))
+        For c = 1 To colCount
+            table.SetCellString r + 2, c, CStr(row(c - 1))
+            Call FormatTableCell(table, r + 2, c, 2.5, False)
+        Next
+    Next
+
+    For c = 1 To colCount
+        table.SetColumnSize c, TableColumnWidth(title, headers(c - 1), rows, c - 1)
+    Next
+
+    For r = 1 To rowCount
+        table.SetRowSize r, CDbl(rowHeight)
+    Next
+
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
+    AddDrawingTable = True
+End Function
+
+Sub AddTableTitleText(view, title, x, y)
+    Dim txt
+    Set txt = Nothing
+
+    On Error Resume Next
+    Set txt = view.Texts.Add(CStr(title), CDbl(x), CDbl(y))
+    If Not txt Is Nothing Then
+        txt.Name = SafeTableName(title) & "_TITLE"
+        txt.SetFontSize 0, 0, 3.0
+        txt.SetFontStyle 0, 0, 1
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+Sub FormatTableCell(table, rowIndex, colIndex, fontSize, bold)
+    Dim txt
+    Set txt = Nothing
+
+    On Error Resume Next
+    Set txt = table.GetCellObject(CLng(rowIndex), CLng(colIndex))
+    If Not txt Is Nothing Then
+        txt.SetFontSize 0, 0, CDbl(fontSize)
+        If CBool(bold) Then txt.SetFontStyle 0, 0, 1
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+Function AddTextTableFallback(view, title, headers, rows, x, y)
+    AddTextTableFallback = False
+
+    Dim textValue
+    Dim r
+    Dim row
+
+    textValue = CStr(title) & vbCrLf & vbCrLf & Join(headers, " | ")
+
+    For r = 0 To rows.Count - 1
+        row = rows.Item(CStr(r))
+        textValue = textValue & vbCrLf & Join(row, " | ")
+    Next
+
+    Dim txt
+    Set txt = Nothing
+
+    On Error Resume Next
+    Set txt = view.Texts.Add(textValue, CDbl(x), CDbl(y))
+    txt.Name = SafeTableName(title) & "_TEXT_FALLBACK"
+    txt.SetFontSize 0, 0, 2.5
+    If Err.Number = 0 Then AddTextTableFallback = True
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function TableColumnWidth(tableTitle, header, rows, columnIndex)
+    Dim estimated
+    estimated = EstimateColumnWidth(header, rows, columnIndex)
+
+    If CStr(tableTitle) = WeldJointTableTitle() Then
+        Select Case CLng(columnIndex)
+            Case 0: TableColumnWidth = BoundDouble(estimated, 20.0, 24.0)
+            Case 1: TableColumnWidth = BoundDouble(estimated, 18.0, 22.0)
+            Case 2: TableColumnWidth = BoundDouble(estimated, 30.0, 34.0)
+            Case 3: TableColumnWidth = BoundDouble(estimated, 32.0, 38.0)
+            Case 4: TableColumnWidth = BoundDouble(estimated, 22.0, 26.0)
+            Case 5: TableColumnWidth = BoundDouble(estimated, 16.0, 18.0)
+            Case 6: TableColumnWidth = BoundDouble(estimated, 55.0, 78.0)
+            Case Else: TableColumnWidth = BoundDouble(estimated, 18.0, 45.0)
+        End Select
+        Exit Function
+    End If
+
+    If CStr(tableTitle) = MaterialConsumptionTableTitle() Then
+        Select Case CLng(columnIndex)
+            Case 0: TableColumnWidth = BoundDouble(estimated, 16.0, 18.0)
+            Case 1: TableColumnWidth = BoundDouble(estimated, 30.0, 38.0)
+            Case 2: TableColumnWidth = BoundDouble(estimated, 34.0, 46.0)
+            Case 3: TableColumnWidth = BoundDouble(estimated, 8.0, 11.0)
+            Case 4: TableColumnWidth = BoundDouble(estimated, 36.0, 42.0)
+            Case 5: TableColumnWidth = BoundDouble(estimated, 34.0, 40.0)
+            Case 6: TableColumnWidth = BoundDouble(estimated, 18.0, 24.0)
+            Case 7: TableColumnWidth = BoundDouble(estimated, 34.0, 42.0)
+            Case Else: TableColumnWidth = BoundDouble(estimated, 18.0, 45.0)
+        End Select
+        Exit Function
+    End If
+
+    TableColumnWidth = estimated
+End Function
+
+Function BoundDouble(value, minValue, maxValue)
+    BoundDouble = CDbl(value)
+    If BoundDouble < CDbl(minValue) Then BoundDouble = CDbl(minValue)
+    If BoundDouble > CDbl(maxValue) Then BoundDouble = CDbl(maxValue)
+End Function
+
+Function TableTotalWidth(title, headers, rows)
+    Dim total
+    Dim i
+    total = 0.0
+
+    For i = LBound(headers) To UBound(headers)
+        total = total + TableColumnWidth(title, headers(i), rows, i)
+    Next
+
+    TableTotalWidth = total
+End Function
+
+Function TableBlockHeight(rows)
+    TableBlockHeight = 7.0 + ((CDbl(rows.Count) + 1.0) * 5.5)
+End Function
+
+Function TablesFitOnSheet(sheet, headersA, rowsA, headersB, rowsB, x, y)
+    TablesFitOnSheet = True
+
+    Dim sheetW
+    Dim sheetH
+    If Not GetSheetSizeMm(sheet, sheetW, sheetH) Then Exit Function
+
+    Dim requiredWidth
+    Dim requiredHeight
+
+    requiredWidth = TableTotalWidth(WeldJointTableTitle(), headersA, rowsA)
+    If TableTotalWidth(MaterialConsumptionTableTitle(), headersB, rowsB) > requiredWidth Then
+        requiredWidth = TableTotalWidth(MaterialConsumptionTableTitle(), headersB, rowsB)
+    End If
+
+    requiredHeight = TableBlockHeight(rowsA) + 10.0 + TableBlockHeight(rowsB)
+
+    If CDbl(x) + CDbl(requiredWidth) + 10.0 > CDbl(sheetW) Then TablesFitOnSheet = False
+    If CDbl(y) - CDbl(requiredHeight) < 10.0 Then TablesFitOnSheet = False
+End Function
+
+Function DefaultTableTopY(sheet, fallbackY)
+    DefaultTableTopY = CDbl(fallbackY)
+
+    Dim sheetW
+    Dim sheetH
+    If GetSheetSizeMm(sheet, sheetW, sheetH) Then
+        DefaultTableTopY = CDbl(sheetH) - 25.0
+        If DefaultTableTopY < 80.0 Then DefaultTableTopY = CDbl(fallbackY)
+    End If
+End Function
+
+Function GetSheetSizeMm(sheet, ByRef widthMm, ByRef heightMm)
+    GetSheetSizeMm = False
+    widthMm = 0.0
+    heightMm = 0.0
+
+    On Error Resume Next
+    Err.Clear
+    widthMm = CDbl(sheet.GetPaperWidth)
+    heightMm = CDbl(sheet.GetPaperHeight)
+    If Err.Number = 0 Then
+        GetSheetSizeMm = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    sheet.GetPaperWidth widthMm
+    sheet.GetPaperHeight heightMm
+    If Err.Number = 0 Then
+        GetSheetSizeMm = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    widthMm = CDbl(sheet.PaperWidth)
+    heightMm = CDbl(sheet.PaperHeight)
+    If Err.Number = 0 Then
+        GetSheetSizeMm = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Function AddUnplacedLabelsTable(sheet, unplacedLabels)
+    AddUnplacedLabelsTable = False
+
+    If sheet Is Nothing Then Exit Function
+    If unplacedLabels.Count = 0 Then Exit Function
+
+    Dim rows
+    Set rows = NewList()
+
+    Dim i
+    Dim row
+
+    For i = 0 To unplacedLabels.Count - 1
+        row = Array("")
+        row(0) = CStr(unplacedLabels.Item(CStr(i)))
+        ListAdd rows, row
+    Next
+
+    AddUnplacedLabelsTable = AddDrawingTable(sheet, _
+                                             "UNPLACED WELD SYMBOLS / OZNAKE ZA RUCNI PREGLED", _
+                                             Array("Weld ID"), rows, 20.0, 35.0)
+End Function
+
+Function PlaceUnplacedByFallbackGrid(sheet, unplacedLabels, labelChoice, ByRef placedCount, _
+                                     ByRef textFallbackCount, labelDebugLines)
+    PlaceUnplacedByFallbackGrid = 0
+
+    If sheet Is Nothing Then Exit Function
+    If unplacedLabels.Count = 0 Then Exit Function
+
+    Dim view
+    Set view = SelectFallbackViewForAutomaticLabels(sheet)
+    If view Is Nothing Then Exit Function
+
+    Dim remaining
+    Set remaining = NewList()
+
+    Dim xMin
+    Dim xMax
+    Dim yMin
+    Dim yMax
+    Dim startX
+    Dim startY
+    Dim stepX
+    Dim stepY
+    Dim cols
+
+    stepX = 18.0
+    stepY = 8.0
+    cols = 4
+
+    If GetViewBounds(view, xMin, xMax, yMin, yMax) Then
+        startX = CDbl(xMin) + 10.0
+        startY = CDbl(yMax) - 10.0
+        If (CDbl(xMax) - CDbl(xMin)) > 100.0 Then cols = 5
+        If (CDbl(xMax) - CDbl(xMin)) < 70.0 Then cols = 3
+    Else
+        startX = 20.0
+        startY = 200.0
+    End If
+
+    Dim i
+    Dim weldId
+    Dim x
+    Dim y
+    Dim colIndex
+    Dim rowIndex
+    Dim method
+
+    For i = 0 To unplacedLabels.Count - 1
+        weldId = CStr(unplacedLabels.Item(CStr(i)))
+        colIndex = i Mod cols
+        rowIndex = Int(i / cols)
+        x = startX + (CDbl(colIndex) * stepX)
+        y = startY - (CDbl(rowIndex) * stepY)
+
+        method = AddWeldSymbolOrTextAt(view, weldId, labelChoice, x, y)
+
+        If method <> "" Then
+            PlaceUnplacedByFallbackGrid = PlaceUnplacedByFallbackGrid + 1
+            If method = "SYMBOL" Then placedCount = placedCount + 1
+            If method = "TEXT" Then textFallbackCount = textFallbackCount + 1
+            ListAdd labelDebugLines, weldId & ": fallback grid placement = " & method & " on view " & ObjectName(view)
+        Else
+            ListAdd remaining, weldId
+            ListAdd labelDebugLines, weldId & ": fallback grid placement failed"
+        End If
+    Next
+
+    Call ReplaceListContents(unplacedLabels, remaining)
+End Function
+
+Function AddWeldSymbolOrTextAt(view, weldId, labelChoice, x, y)
+    AddWeldSymbolOrTextAt = ""
+
+    Dim labelText
+    labelText = FormatWeldLabel(weldId, labelChoice)
+
+    If AddWeldSymbolAnnotation(view, labelText, weldId, x, y, x, y) Then
+        AddWeldSymbolOrTextAt = "SYMBOL"
+        Exit Function
+    End If
+
+    If AddWeldLabelText(view, labelText, weldId, x, y, x, y) Then
+        AddWeldSymbolOrTextAt = "TEXT"
+    End If
+End Function
+
+Function SelectFallbackViewForAutomaticLabels(sheet)
+    Set SelectFallbackViewForAutomaticLabels = Nothing
+
+    Dim defaultView
+    Set defaultView = LargestCandidateView(sheet)
+
+    If defaultView Is Nothing Then
+        Set SelectFallbackViewForAutomaticLabels = FirstCandidateView(sheet)
+        Exit Function
+    End If
+
+    Dim msg
+    msg = "Select fallback view for automatic weld label placement" & vbCrLf & vbCrLf & _
+          CandidateViewListText(sheet) & vbCrLf & _
+          "Enter view number. Empty = largest/default view: " & ObjectName(defaultView)
+
+    Dim inputValue
+    inputValue = InputBox(msg, MACRO_NAME, "")
+
+    If Trim(inputValue) <> "" And IsNumeric(inputValue) Then
+        Set SelectFallbackViewForAutomaticLabels = CandidateViewByOrdinal(sheet, CLng(inputValue))
+    End If
+
+    If SelectFallbackViewForAutomaticLabels Is Nothing Then
+        Set SelectFallbackViewForAutomaticLabels = defaultView
+    End If
+End Function
+
+Function CandidateViewListText(sheet)
+    CandidateViewListText = ""
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim ordinal
+    Dim view
+    ordinal = 0
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                ordinal = ordinal + 1
+                If CandidateViewListText <> "" Then CandidateViewListText = CandidateViewListText & vbCrLf
+                CandidateViewListText = CandidateViewListText & CStr(ordinal) & " = " & ObjectName(view)
+            End If
+        End If
+    Next
+End Function
+
+Function CandidateViewByOrdinal(sheet, requestedOrdinal)
+    Set CandidateViewByOrdinal = Nothing
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim ordinal
+    Dim view
+    ordinal = 0
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                ordinal = ordinal + 1
+                If CLng(ordinal) = CLng(requestedOrdinal) Then
+                    Set CandidateViewByOrdinal = view
+                    Exit Function
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function LargestCandidateView(sheet)
+    Set LargestCandidateView = Nothing
+
+    Dim views
+    Set views = Nothing
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    Dim i
+    Dim view
+    Dim area
+    Dim bestArea
+    bestArea = -1.0
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        On Error Resume Next
+        Set view = views.Item(i)
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If IsCandidateLabelView(view) Then
+                area = ViewArea(view)
+                If area > bestArea Then
+                    bestArea = area
+                    Set LargestCandidateView = view
+                End If
+            End If
+        End If
+    Next
+End Function
+
+Function ViewArea(view)
+    ViewArea = 0.0
+
+    Dim xMin
+    Dim xMax
+    Dim yMin
+    Dim yMax
+
+    If GetViewBounds(view, xMin, xMax, yMin, yMax) Then
+        ViewArea = Abs((CDbl(xMax) - CDbl(xMin)) * (CDbl(yMax) - CDbl(yMin)))
+    End If
+End Function
+
+Function PlaceLabelsAsSideList(sheet, unplacedLabels, labelChoice)
+    PlaceLabelsAsSideList = 0
+
+    If sheet Is Nothing Then Exit Function
+    If unplacedLabels.Count = 0 Then Exit Function
+
+    Dim view
+    Set view = FirstCandidateView(sheet)
+    If view Is Nothing Then Exit Function
+
+    Dim xMin
+    Dim xMax
+    Dim yMin
+    Dim yMax
+    Dim startX
+    Dim startY
+
+    If GetViewBounds(view, xMin, xMax, yMin, yMax) Then
+        startX = CDbl(xMax) + 10.0
+        startY = CDbl(yMax)
+    Else
+        startX = 20.0
+        startY = 200.0
+    End If
+
+    Dim i
+    Dim weldId
+    Dim labelText
+    Dim txt
+
+    For i = 0 To unplacedLabels.Count - 1
+        weldId = CStr(unplacedLabels.Item(CStr(i)))
+        labelText = FormatWeldLabel(weldId, labelChoice)
+
+        Set txt = Nothing
+        On Error Resume Next
+        Set txt = view.Texts.Add(labelText, startX, startY - (CDbl(i) * 6.0))
+        If Err.Number = 0 And Not txt Is Nothing Then
+            txt.Name = "SIDE_LABEL_" & weldId
+            txt.SetFontSize 0, 0, DEFAULT_TEXT_HEIGHT_MM
+            PlaceLabelsAsSideList = PlaceLabelsAsSideList + 1
+        End If
+        Err.Clear
+        On Error GoTo 0
+    Next
+End Function
+
+Function LabelPlacementFailureReason(modelGeometryFoundCount, projectedGeometryFoundCount, _
+                                     labelPointCalculatedCount, projectionFailedCount)
+    If CDbl(labelPointCalculatedCount) > 0 And CDbl(projectionFailedCount) > 0 Then
+        LabelPlacementFailureReason = "Calibrated 3D to 2D view transform failed or no calibrated view was found."
+        Exit Function
+    End If
+
+    If CDbl(modelGeometryFoundCount) > 0 And CDbl(projectedGeometryFoundCount) = 0 Then
+        LabelPlacementFailureReason = "WELD_MAP geometry was found, but drawing view calibration is missing or does not match."
+        Exit Function
+    End If
+
+    If CDbl(modelGeometryFoundCount) > 0 Then
+        LabelPlacementFailureReason = "WELD_MAP geometry was found, but calibrated placement still failed."
+        Exit Function
+    End If
+
+    LabelPlacementFailureReason = "No WELD_MAP anchor/geometry point could be used for calibrated placement."
+End Function
+
+Function WriteLabelDebugLog(drawingDoc, labelDebugLines)
+    WriteLabelDebugLog = ""
+
+    If labelDebugLines Is Nothing Then Exit Function
+    If labelDebugLines.Count = 0 Then Exit Function
+
+    Dim folderPath
+    folderPath = DrawingFolder(drawingDoc)
+
+    If Trim(folderPath) = "" Then
+        On Error Resume Next
+        folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+        If Err.Number <> 0 Then
+            Err.Clear
+            folderPath = ""
+        End If
+        On Error GoTo 0
+    End If
+
+    If Trim(folderPath) = "" Then Exit Function
+
+    Dim fso
+    Dim filePath
+    Dim file
+    Dim i
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    filePath = fso.BuildPath(folderPath, "drawing_weld_label_debug.txt")
+
+    On Error Resume Next
+    Set file = fso.CreateTextFile(filePath, True, False)
+    If Err.Number <> 0 Or file Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    file.WriteLine "Drawing weld label debug"
+    file.WriteLine "Generated: " & CStr(Now)
+    file.WriteLine ""
+
+    For i = 0 To labelDebugLines.Count - 1
+        file.WriteLine CStr(labelDebugLines.Item(CStr(i)))
+    Next
+
+    file.Close
+    On Error GoTo 0
+
+    WriteLabelDebugLog = filePath
+End Function
+
+Function GetTableView(sheet)
+    Set GetTableView = Nothing
+
+    Dim views
+    Dim view
+    Dim i
+    Dim nameValue
+
+    On Error Resume Next
+    Set views = sheet.Views
+    On Error GoTo 0
+
+    If views Is Nothing Then Exit Function
+
+    For i = 1 To views.Count
+        Set view = Nothing
+        nameValue = ""
+
+        On Error Resume Next
+        Set view = views.Item(i)
+        nameValue = UCase(CStr(view.Name))
+        On Error GoTo 0
+
+        If Not view Is Nothing Then
+            If InStr(nameValue, "MAIN") > 0 Then
+                Set GetTableView = view
+                Exit Function
+            End If
+        End If
+    Next
+
+    On Error Resume Next
+    Set GetTableView = views.ActiveView
+    On Error GoTo 0
+
+    If GetTableView Is Nothing Then
+        On Error Resume Next
+        Set GetTableView = views.Item(1)
+        On Error GoTo 0
+    End If
+End Function
+
+Function EstimateColumnWidth(header, rows, columnIndex)
+    Dim maxLen
+    Dim r
+    Dim row
+    Dim value
+
+    maxLen = Len(CStr(header))
+
+    For r = 0 To rows.Count - 1
+        row = rows.Item(CStr(r))
+        value = CStr(row(columnIndex))
+        If Len(value) > maxLen Then maxLen = Len(value)
+    Next
+
+    EstimateColumnWidth = 12.0 + (CDbl(maxLen) * 2.1)
+    If EstimateColumnWidth < 22.0 Then EstimateColumnWidth = 22.0
+    If EstimateColumnWidth > 70.0 Then EstimateColumnWidth = 70.0
+End Function
+
+Function SafeTableName(value)
+    Dim s
+    s = UCase(CStr(value))
+    s = Replace(s, " ", "_")
+    s = Replace(s, "/", "_")
+    s = Replace(s, "\", "_")
+    s = Replace(s, ":", "_")
+    s = Replace(s, "-", "_")
+    s = Replace(s, "__", "_")
+
+    If Len(s) > 60 Then s = Left(s, 60)
+    SafeTableName = s
+End Function
+
+' ---------------------------------------------------------------------------
+' CSV export
+' ---------------------------------------------------------------------------
+
+Sub ExportCsvFiles(drawingDoc, tableHeaders, tableRows, consumptionHeaders, consumptionRows)
+    Dim folderPath
+    folderPath = DrawingFolder(drawingDoc)
+
+    If folderPath = "" Then
+        folderPath = AskString("Drawing is not saved. Enter folder path for CSV export:", "")
+    End If
+
+    If Trim(folderPath) = "" Then Exit Sub
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Not fso.FolderExists(folderPath) Then
+        MsgBox "CSV folder does not exist:" & vbCrLf & folderPath, vbExclamation, MACRO_NAME
+        Exit Sub
+    End If
+
+    Dim tablePath
+    Dim consumptionPath
+
+    tablePath = fso.BuildPath(folderPath, "drawing_weld_table.csv")
+    consumptionPath = fso.BuildPath(folderPath, "drawing_weld_consumption.csv")
+
+    Call WriteCsv(tablePath, tableHeaders, tableRows)
+    Call WriteCsv(consumptionPath, consumptionHeaders, consumptionRows)
+
+    MsgBox "CSV export completed:" & vbCrLf & tablePath & vbCrLf & consumptionPath, _
+           vbInformation, MACRO_NAME
+End Sub
+
+Function DrawingFolder(drawingDoc)
+    DrawingFolder = ""
+
+    Dim fullName
+    Dim fso
+
+    fullName = ""
+    On Error Resume Next
+    fullName = CStr(drawingDoc.FullName)
+    On Error GoTo 0
+
+    If fullName = "" Then Exit Function
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    DrawingFolder = fso.GetParentFolderName(fullName)
+End Function
+
+Sub WriteCsv(filePath, headers, rows)
+    Dim fso
+    Dim ts
+    Dim r
+    Dim row
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.CreateTextFile(filePath, True, False)
+
+    ts.WriteLine CsvLine(headers)
+
+    For r = 0 To rows.Count - 1
+        row = rows.Item(CStr(r))
+        ts.WriteLine CsvLine(row)
+    Next
+
+    ts.Close
+End Sub
+
+Function CsvLine(values)
+    Dim i
+    Dim line
+    line = ""
+
+    For i = LBound(values) To UBound(values)
+        If i > LBound(values) Then line = line & ";"
+        line = line & CsvCell(CStr(values(i)))
+    Next
+
+    CsvLine = line
+End Function
+
+Function CsvCell(value)
+    value = Replace(CStr(value), """", """""")
+
+    If InStr(value, ";") > 0 Or InStr(value, """") > 0 Or _
+       InStr(value, vbCr) > 0 Or InStr(value, vbLf) > 0 Then
+        CsvCell = """" & value & """"
+    Else
+        CsvCell = value
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Generic helpers
+' ---------------------------------------------------------------------------
+
+Function NewList()
+    Dim list
+    Set list = CreateObject("Scripting.Dictionary")
+    Set NewList = list
+End Function
+
+Function JoinArray(values, delimiter)
+    Dim s
+    Dim i
+    s = ""
+
+    For i = LBound(values) To UBound(values)
+        If s <> "" Then s = s & CStr(delimiter)
+        s = s & CStr(values(i))
+    Next
+
+    JoinArray = s
+End Function
+
+Sub ListAdd(list, value)
+    list.Add CStr(list.Count), value
+End Sub
+
+Sub ListAddUnique(list, value)
+    If Not ListContains(list, value) Then
+        ListAdd list, value
+    End If
+End Sub
+
+Sub ReplaceListContents(targetList, sourceList)
+    targetList.RemoveAll
+
+    Dim i
+    For i = 0 To sourceList.Count - 1
+        ListAdd targetList, sourceList.Item(CStr(i))
+    Next
+End Sub
+
+Function ListContains(list, value)
+    ListContains = False
+
+    Dim i
+    For i = 0 To list.Count - 1
+        If CStr(list.Item(CStr(i))) = CStr(value) Then
+            ListContains = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Function ListToMultilineText(list)
+    Dim s
+    Dim i
+    s = ""
+
+    For i = 0 To list.Count - 1
+        If s <> "" Then s = s & vbCrLf
+        s = s & CStr(list.Item(CStr(i)))
+    Next
+
+    ListToMultilineText = s
+End Function
+
+Function GetDictString(dict, key)
+    GetDictString = ""
+    If dict Is Nothing Then Exit Function
+    If dict.Exists(CStr(key)) Then GetDictString = CStr(dict.Item(CStr(key)))
+End Function
+
+Sub SetDictString(dict, key, value)
+    If dict.Exists(CStr(key)) Then
+        dict.Item(CStr(key)) = CStr(value)
+    Else
+        dict.Add CStr(key), CStr(value)
+    End If
+End Sub
+
+Function AskString(prompt, defaultValue)
+    AskString = InputBox(prompt, MACRO_NAME, CStr(defaultValue))
+End Function
+
+Function AskYesNo(prompt, defaultYes)
+    Dim buttons
+    Dim result
+
+    If defaultYes Then
+        buttons = vbQuestion + vbYesNo + vbDefaultButton1
+    Else
+        buttons = vbQuestion + vbYesNo + vbDefaultButton2
+    End If
+
+    result = MsgBox(prompt, buttons, MACRO_NAME)
+    AskYesNo = (result = vbYes)
+End Function
+
+Function AskNumber(prompt, defaultValue)
+    Dim inputValue
+    inputValue = InputBox(prompt, MACRO_NAME, CStr(defaultValue))
+
+    If Trim(inputValue) = "" Then
+        AskNumber = CDbl(defaultValue)
+    Else
+        AskNumber = ToDouble(inputValue)
+    End If
+End Function
+
+Function ToDouble(value)
+    Dim s
+    Dim i
+    Dim ch
+    Dim cleaned
+    Dim decimalDot
+    Dim decimalComma
+
+    s = Trim(CStr(value))
+    cleaned = ""
+
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        If (ch >= "0" And ch <= "9") Or ch = "." Or ch = "," Or ch = "-" Then
+            cleaned = cleaned & ch
+        End If
+    Next
+
+    If cleaned = "" Or cleaned = "-" Then
+        ToDouble = 0.0
+        Exit Function
+    End If
+
+    decimalDot = InStrRev(cleaned, ".")
+    decimalComma = InStrRev(cleaned, ",")
+
+    If decimalDot > 0 And decimalComma > 0 Then
+        If decimalDot > decimalComma Then
+            cleaned = Replace(cleaned, ",", "")
+        Else
+            cleaned = Replace(cleaned, ".", "")
+            cleaned = Replace(cleaned, ",", ".")
+        End If
+    ElseIf decimalComma > 0 Then
+        cleaned = Replace(cleaned, ",", ".")
+    End If
+
+    On Error Resume Next
+    Err.Clear
+    ToDouble = CDbl(cleaned)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ToDouble = CDbl(Replace(cleaned, ".", ","))
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        ToDouble = 0.0
+    End If
+    On Error GoTo 0
+End Function
+
+Function Fmt2(value)
+    Dim s
+    On Error Resume Next
+    s = CStr(Round(CDbl(value), 2))
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = "0"
+    End If
+    On Error GoTo 0
+
+    If InStr(s, ",") > 0 Then s = Replace(s, ",", ".")
+    If InStr(s, ".") = 0 Then s = s & ".00"
+
+    Dim decimalPart
+    decimalPart = Split(s, ".")
+    If UBound(decimalPart) = 1 Then
+        If Len(decimalPart(1)) = 1 Then s = s & "0"
+    End If
+
+    Fmt2 = s
+End Function
+
+Function Fmt0(value)
+    Dim s
+    On Error Resume Next
+    s = CStr(Round(CDbl(value), 0))
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = "0"
+    End If
+    On Error GoTo 0
+
+    If InStr(s, ",") > 0 Then s = Replace(s, ",", ".")
+    If InStr(s, ".") > 0 Then s = Split(s, ".")(0)
+
+    Fmt0 = s
+End Function
+
+Function PadLeft(value, totalLength, padChar)
+    Dim s
+    s = CStr(value)
+
+    Do While Len(s) < CLng(totalLength)
+        s = CStr(padChar) & s
+    Loop
+
+    PadLeft = s
+End Function
+
+Function YesNoText(value)
+    If CBool(value) Then
+        YesNoText = "Yes"
+    Else
+        YesNoText = "No"
+    End If
+End Function
