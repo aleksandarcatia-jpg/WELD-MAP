@@ -14,6 +14,7 @@ Option Explicit
 Const MACRO_NAME = "GenerateWeldLabelsFromRegister"
 Const REGISTER_FILE_NAME = "weld_design_register.csv"
 Const REPORT_FILE_NAME = "weld_labels_from_register_report.txt"
+Const SETTINGS_FILE_NAME = "weld_map_settings.ini"
 
 Sub CATMain()
     Dim doc
@@ -238,6 +239,7 @@ Function ResolveRegisterPath(doc)
 
     Dim candidatePath
     Dim drawingFolder
+    Dim linkedProductFolder
     Dim lastRegisterPath
     Dim inputDefault
     Dim userPath
@@ -250,6 +252,26 @@ Function ResolveRegisterPath(doc)
         If fso.FileExists(candidatePath) Then
             ResolveRegisterPath = candidatePath
             Exit Function
+        End If
+    End If
+
+    linkedProductFolder = FindLinkedProductFolder(doc)
+    If linkedProductFolder <> "" Then
+        candidatePath = fso.BuildPath(linkedProductFolder, REGISTER_FILE_NAME)
+
+        If fso.FileExists(candidatePath) Then
+            Call WriteLastRegisterPath(doc, candidatePath)
+            ResolveRegisterPath = candidatePath
+            Exit Function
+        End If
+
+        lastRegisterPath = ReadRegisterPathFromSettingsFile(fso.BuildPath(linkedProductFolder, SETTINGS_FILE_NAME))
+        If lastRegisterPath <> "" Then
+            If fso.FileExists(lastRegisterPath) Then
+                Call WriteLastRegisterPath(doc, lastRegisterPath)
+                ResolveRegisterPath = lastRegisterPath
+                Exit Function
+            End If
         End If
     End If
 
@@ -288,16 +310,10 @@ Function SettingsPath(doc)
     folderPath = DocumentFolderPath(doc)
 
     If folderPath = "" Then
-        On Error Resume Next
-        folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
-        If Err.Number <> 0 Or Trim(CStr(folderPath)) = "" Then
-            Err.Clear
-            folderPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
-        End If
-        On Error GoTo 0
+        folderPath = DesktopFolderPath()
     End If
 
-    SettingsPath = CreateObject("Scripting.FileSystemObject").BuildPath(CStr(folderPath), "weld_map_settings.txt")
+    SettingsPath = CreateObject("Scripting.FileSystemObject").BuildPath(CStr(folderPath), SETTINGS_FILE_NAME)
 End Function
 
 Function ReadLastRegisterPath(doc)
@@ -308,22 +324,48 @@ Function ReadLastRegisterPath(doc)
 
     Dim settingsFilePath
     settingsFilePath = SettingsPath(doc)
-    If settingsFilePath = "" Then Exit Function
+    ReadLastRegisterPath = ReadRegisterPathFromSettingsFile(settingsFilePath)
+    If ReadLastRegisterPath <> "" Then Exit Function
+
+    settingsFilePath = fso.BuildPath(DesktopFolderPath(), SETTINGS_FILE_NAME)
+    ReadLastRegisterPath = ReadRegisterPathFromSettingsFile(settingsFilePath)
+End Function
+
+Function ReadRegisterPathFromSettingsFile(settingsFilePath)
+    ReadRegisterPathFromSettingsFile = ""
+
+    If Trim(CStr(settingsFilePath)) = "" Then Exit Function
+
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
     If Not fso.FileExists(settingsFilePath) Then Exit Function
 
     Dim ts
     Dim lineText
+
+    On Error Resume Next
     Set ts = fso.OpenTextFile(settingsFilePath, 1, False)
+    If Err.Number <> 0 Or ts Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
 
     Do While Not ts.AtEndOfStream
         lineText = ts.ReadLine
         If Left(lineText, Len("LastRegisterPath=")) = "LastRegisterPath=" Then
-            ReadLastRegisterPath = Trim(Mid(lineText, Len("LastRegisterPath=") + 1))
+            ReadRegisterPathFromSettingsFile = Trim(Mid(lineText, Len("LastRegisterPath=") + 1))
+            Exit Do
+        End If
+        If Left(lineText, Len("RegisterPath=")) = "RegisterPath=" Then
+            ReadRegisterPathFromSettingsFile = Trim(Mid(lineText, Len("RegisterPath=") + 1))
             Exit Do
         End If
     Loop
 
     ts.Close
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
 End Function
 
 Sub WriteLastRegisterPath(doc, registerPath)
@@ -337,7 +379,11 @@ Sub WriteLastRegisterPath(doc, registerPath)
     Set fso = CreateObject("Scripting.FileSystemObject")
     Set ts = fso.CreateTextFile(settingsFilePath, True, False)
     If Err.Number = 0 And Not ts Is Nothing Then
+        ts.WriteLine "[WeldMap]"
         ts.WriteLine "LastRegisterPath=" & CStr(registerPath)
+        ts.WriteLine "RegisterPath=" & CStr(registerPath)
+        ts.WriteLine "RegisterFolder=" & fso.GetParentFolderName(CStr(registerPath))
+        ts.WriteLine "UpdatedAt=" & CStr(Now)
         ts.Close
     End If
     If Err.Number <> 0 Then Err.Clear
@@ -566,16 +612,22 @@ Function BuildOutputPath(doc, fileName)
     folderPath = DocumentFolderPath(doc)
 
     If folderPath = "" Then
-        On Error Resume Next
-        folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
-        If Err.Number <> 0 Or Trim(CStr(folderPath)) = "" Then
-            Err.Clear
-            folderPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
-        End If
-        On Error GoTo 0
+        folderPath = DesktopFolderPath()
     End If
 
     BuildOutputPath = CreateObject("Scripting.FileSystemObject").BuildPath(CStr(folderPath), CStr(fileName))
+End Function
+
+Function DesktopFolderPath()
+    DesktopFolderPath = ""
+
+    On Error Resume Next
+    DesktopFolderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+    If Err.Number <> 0 Or Trim(CStr(DesktopFolderPath)) = "" Then
+        Err.Clear
+        DesktopFolderPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
+    End If
+    On Error GoTo 0
 End Function
 
 Function DocumentFolderPath(doc)
@@ -590,4 +642,73 @@ Function DocumentFolderPath(doc)
     On Error GoTo 0
 
     DocumentFolderPath = Trim(CStr(DocumentFolderPath))
+End Function
+
+Function FindLinkedProductFolder(doc)
+    FindLinkedProductFolder = ""
+
+    Dim sheets
+    Set sheets = Nothing
+    On Error Resume Next
+    Set sheets = doc.Sheets
+    If Err.Number <> 0 Or sheets Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    Dim s
+    Dim v
+    Dim sheet
+    Dim view
+    Dim folderPath
+
+    For s = 1 To sheets.Count
+        Set sheet = Nothing
+        On Error Resume Next
+        Set sheet = sheets.Item(s)
+        If Err.Number <> 0 Or sheet Is Nothing Then
+            Err.Clear
+            On Error GoTo 0
+        Else
+            On Error GoTo 0
+            For v = 1 To sheet.Views.Count
+                Set view = Nothing
+                On Error Resume Next
+                Set view = sheet.Views.Item(v)
+                If Err.Number <> 0 Or view Is Nothing Then
+                    Err.Clear
+                    On Error GoTo 0
+                Else
+                    On Error GoTo 0
+                    folderPath = LinkedFolderFromView(view)
+                    If folderPath <> "" Then
+                        FindLinkedProductFolder = folderPath
+                        Exit Function
+                    End If
+                End If
+            Next
+        End If
+    Next
+End Function
+
+Function LinkedFolderFromView(view)
+    LinkedFolderFromView = ""
+
+    Dim linkedDoc
+    Set linkedDoc = Nothing
+
+    On Error Resume Next
+    Set linkedDoc = view.GenerativeBehavior.Document
+    If Err.Number <> 0 Or linkedDoc Is Nothing Then
+        Err.Clear
+        Set linkedDoc = view.GenerativeBehavior.ReferenceDocument
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
+    If linkedDoc Is Nothing Then Exit Function
+
+    LinkedFolderFromView = DocumentFolderPath(linkedDoc)
 End Function

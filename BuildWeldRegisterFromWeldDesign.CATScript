@@ -19,6 +19,7 @@ Option Explicit
 Const MACRO_NAME = "BuildWeldRegisterFromWeldDesign"
 Const REGISTER_FILE_NAME = "weld_design_register.csv"
 Const REPORT_FILE_NAME = "weld_design_register_report.txt"
+Const SETTINGS_FILE_NAME = "weld_map_settings.ini"
 
 Sub CATMain()
     Dim doc
@@ -89,6 +90,7 @@ Sub CATMain()
     reportFilePath = BuildOutputPath(doc, REPORT_FILE_NAME)
 
     Call WriteCsvFile(registerFilePath, RegisterHeaders(), csvRows)
+    Call WriteWeldMapSettings(doc, registerFilePath, reportFilePath)
     Call AppendRegisterSummary(report, jointRecords)
     Call WriteTextFile(reportFilePath, report)
 
@@ -662,6 +664,41 @@ Sub WriteTextFile(filePath, lines)
         ts.WriteLine SafeText(lines.Item(i))
     Next
     ts.Close
+End Sub
+
+Sub WriteWeldMapSettings(doc, registerFilePath, reportFilePath)
+    Dim settingsPath
+    settingsPath = BuildOutputPath(doc, SETTINGS_FILE_NAME)
+    Call WriteWeldMapSettingsFile(settingsPath, doc, registerFilePath, reportFilePath)
+
+    Dim desktopSettingsPath
+    desktopSettingsPath = CreateObject("Scripting.FileSystemObject").BuildPath(DesktopFolderPath(), SETTINGS_FILE_NAME)
+    If UCase(CStr(desktopSettingsPath)) <> UCase(CStr(settingsPath)) Then
+        Call WriteWeldMapSettingsFile(desktopSettingsPath, doc, registerFilePath, reportFilePath)
+    End If
+End Sub
+
+Sub WriteWeldMapSettingsFile(settingsFilePath, doc, registerFilePath, reportFilePath)
+    On Error Resume Next
+
+    Dim fso
+    Dim ts
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.CreateTextFile(settingsFilePath, True, False)
+
+    If Err.Number = 0 And Not ts Is Nothing Then
+        ts.WriteLine "[WeldMap]"
+        ts.WriteLine "LastRegisterPath=" & CStr(registerFilePath)
+        ts.WriteLine "RegisterPath=" & CStr(registerFilePath)
+        ts.WriteLine "RegisterFolder=" & fso.GetParentFolderName(CStr(registerFilePath))
+        ts.WriteLine "LastReportPath=" & CStr(reportFilePath)
+        ts.WriteLine "SourceDocumentPath=" & SafeDocumentFullName(doc)
+        ts.WriteLine "UpdatedAt=" & CStr(Now)
+        ts.Close
+    End If
+
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
 End Sub
 
 Sub AppendRegisterSummary(report, jointRecords)
@@ -1326,16 +1363,22 @@ Function BuildOutputPath(doc, fileName)
     On Error GoTo 0
 
     If Trim(CStr(folderPath)) = "" Then
-        On Error Resume Next
-        folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
-        If Err.Number <> 0 Or Trim(CStr(folderPath)) = "" Then
-            Err.Clear
-            folderPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
-        End If
-        On Error GoTo 0
+        folderPath = DesktopFolderPath()
     End If
 
     BuildOutputPath = CreateObject("Scripting.FileSystemObject").BuildPath(CStr(folderPath), CStr(fileName))
+End Function
+
+Function DesktopFolderPath()
+    DesktopFolderPath = ""
+
+    On Error Resume Next
+    DesktopFolderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+    If Err.Number <> 0 Or Trim(CStr(DesktopFolderPath)) = "" Then
+        Err.Clear
+        DesktopFolderPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
+    End If
+    On Error GoTo 0
 End Function
 
 Function SafeDocumentName(doc)
@@ -1345,6 +1388,18 @@ Function SafeDocumentName(doc)
     If Err.Number <> 0 Then
         Err.Clear
         SafeDocumentName = "<active document>"
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeDocumentFullName(doc)
+    SafeDocumentFullName = ""
+
+    On Error Resume Next
+    SafeDocumentFullName = CStr(doc.FullName)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeDocumentFullName = SafeDocumentName(doc)
     End If
     On Error GoTo 0
 End Function
