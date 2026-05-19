@@ -57,7 +57,7 @@ Sub CATMain()
 
     If jointRecords.Count = 0 Then
         ListAdd report, "No Assembly Joint objects found."
-        Call WriteTextFile(ReportPath(doc, REPORT_FILE_NAME), report)
+        Call WriteTextFile(BuildOutputPath(doc, REPORT_FILE_NAME), report)
         MsgBox "No Assembly Joint objects found." & vbCrLf & _
                "Use CATIA Weld Design to create weld joints first.", vbExclamation, MACRO_NAME
         Exit Sub
@@ -83,19 +83,19 @@ Sub CATMain()
         csvRows.Add RecordToCsvValues(rec)
     Next
 
-    Dim registerPath
-    Dim reportPath
-    registerPath = ReportPath(doc, REGISTER_FILE_NAME)
-    reportPath = ReportPath(doc, REPORT_FILE_NAME)
+    Dim registerFilePath
+    Dim reportFilePath
+    registerFilePath = BuildOutputPath(doc, REGISTER_FILE_NAME)
+    reportFilePath = BuildOutputPath(doc, REPORT_FILE_NAME)
 
-    Call WriteCsvFile(registerPath, RegisterHeaders(), csvRows)
+    Call WriteCsvFile(registerFilePath, RegisterHeaders(), csvRows)
     Call AppendRegisterSummary(report, jointRecords)
-    Call WriteTextFile(reportPath, report)
+    Call WriteTextFile(reportFilePath, report)
 
     MsgBox "Weld Design register completed." & vbCrLf & _
            "Total Assembly Joints found: " & CStr(jointRecords.Count) & vbCrLf & _
-           "CSV: " & registerPath & vbCrLf & _
-           "Report: " & reportPath, vbInformation, MACRO_NAME
+           "CSV: " & registerFilePath & vbCrLf & _
+           "Report: " & reportFilePath, vbInformation, MACRO_NAME
 End Sub
 
 ' ---------------------------------------------------------------------------
@@ -461,7 +461,7 @@ Function LoadWpsLibrary(doc, report)
     Set LoadWpsLibrary = rows
 
     Dim path
-    path = ReportPath(doc, "wps_library.csv")
+    path = BuildOutputPath(doc, "wps_library.csv")
 
     Dim fso
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -1313,9 +1313,10 @@ Function SafeText(value)
     SafeText = s
 End Function
 
-Function ReportPath(doc, fileName)
+Function BuildOutputPath(doc, fileName)
     Dim folderPath
     folderPath = ""
+
     On Error Resume Next
     folderPath = CStr(doc.Path)
     If Err.Number <> 0 Then
@@ -1323,8 +1324,18 @@ Function ReportPath(doc, fileName)
         folderPath = ""
     End If
     On Error GoTo 0
-    If folderPath = "" Then folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
-    ReportPath = CreateObject("Scripting.FileSystemObject").BuildPath(folderPath, fileName)
+
+    If Trim(CStr(folderPath)) = "" Then
+        On Error Resume Next
+        folderPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
+        If Err.Number <> 0 Or Trim(CStr(folderPath)) = "" Then
+            Err.Clear
+            folderPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2)
+        End If
+        On Error GoTo 0
+    End If
+
+    BuildOutputPath = CreateObject("Scripting.FileSystemObject").BuildPath(CStr(folderPath), CStr(fileName))
 End Function
 
 Function SafeDocumentName(doc)
