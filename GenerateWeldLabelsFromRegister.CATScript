@@ -48,7 +48,9 @@ Sub CATMain()
     Dim report
     Set report = NewList()
     ListAdd report, "Weld labels from register"
-    ListAdd report, "Register: " & registerPath
+    Call AppendRegisterLoadingReport(report, registerPath, rows)
+    Call AppendDrawingInventory(doc, report)
+    Call AppendSearchInventory(doc, rows, report)
     ListAdd report, ""
 
     Dim placed
@@ -64,6 +66,7 @@ Sub CATMain()
     Dim rec
     For i = 0 To rows.Count - 1
         Set rec = rows.Item(i)
+        ListAdd report, ""
         If PlaceLabelForRecord(doc, rec, report, nativeUpdated, textFallback) Then
             placed = placed + 1
         Else
@@ -83,6 +86,138 @@ Sub CATMain()
            "Report: " & reportFilePath, vbInformation, MACRO_NAME
 End Sub
 
+Sub AppendRegisterLoadingReport(report, registerPath, rows)
+    ListAdd report, ""
+    ListAdd report, "=== A) Register loading ==="
+    ListAdd report, "Resolved register path: " & CStr(registerPath)
+    ListAdd report, "Number of rows: " & CStr(rows.Count)
+    ListAdd report, "WeldID list: " & RegisterFieldList(rows, "WeldID")
+    ListAdd report, "WeldSymbolName list: " & RegisterFieldList(rows, "WeldSymbolName")
+    ListAdd report, "AssemblyJointIndex list: " & RegisterFieldList(rows, "AssemblyJointIndex")
+End Sub
+
+Function RegisterFieldList(rows, fieldName)
+    Dim textValue
+    textValue = ""
+
+    Dim i
+    Dim itemValue
+    For i = 0 To rows.Count - 1
+        itemValue = DictValue(rows.Item(i), fieldName)
+        If itemValue <> "" Then
+            If textValue <> "" Then textValue = textValue & ", "
+            textValue = textValue & itemValue
+        End If
+    Next
+
+    If textValue = "" Then textValue = "<none>"
+    RegisterFieldList = textValue
+End Function
+
+Sub AppendDrawingInventory(doc, report)
+    ListAdd report, ""
+    ListAdd report, "=== B) Drawing sheets/views inventory ==="
+
+    Dim sheets
+    Set sheets = Nothing
+    On Error Resume Next
+    Set sheets = doc.Sheets
+    If Err.Number <> 0 Or sheets Is Nothing Then
+        ListAdd report, "Sheets: <not accessible>"
+        Err.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    ListAdd report, "Sheets count: " & CStr(SafeCollectionCount(sheets))
+
+    Dim sheetIndex
+    Dim viewIndex
+    Dim sheetObj
+    Dim viewObj
+    Dim views
+
+    For sheetIndex = 1 To SafeCollectionCount(sheets)
+        Set sheetObj = Nothing
+        On Error Resume Next
+        Set sheetObj = sheets.Item(sheetIndex)
+        If Err.Number <> 0 Or sheetObj Is Nothing Then
+            ListAdd report, "Sheet " & CStr(sheetIndex) & ": <not accessible>"
+            Err.Clear
+            On Error GoTo 0
+        Else
+            On Error GoTo 0
+            Set views = Nothing
+            On Error Resume Next
+            Set views = sheetObj.Views
+            If Err.Number <> 0 Or views Is Nothing Then
+                ListAdd report, "Sheet: " & SafeObjectName(sheetObj) & " | Number of views: <not accessible>"
+                Err.Clear
+                On Error GoTo 0
+            Else
+                On Error GoTo 0
+                ListAdd report, "Sheet: " & SafeObjectName(sheetObj) & " | Number of views: " & CStr(SafeCollectionCount(views))
+
+                For viewIndex = 1 To SafeCollectionCount(views)
+                    Set viewObj = Nothing
+                    On Error Resume Next
+                    Set viewObj = views.Item(viewIndex)
+                    If Err.Number <> 0 Or viewObj Is Nothing Then
+                        ListAdd report, "  View " & CStr(viewIndex) & ": <not accessible>"
+                        Err.Clear
+                        On Error GoTo 0
+                    Else
+                        On Error GoTo 0
+                        ListAdd report, "  View: " & SafeObjectName(viewObj)
+                        ListAdd report, "    Scale: " & SafeScalarProperty(viewObj, "Scale")
+                        ListAdd report, "    X: " & SafeScalarProperty(viewObj, "X")
+                        ListAdd report, "    Y: " & SafeScalarProperty(viewObj, "Y")
+                        ListAdd report, "    Texts count: " & SafeChildCollectionCount(viewObj, "Texts")
+                        ListAdd report, "    Tables count: " & SafeChildCollectionCount(viewObj, "Tables")
+                        ListAdd report, "    Generative links: " & ViewGenerativeLinkInfo(viewObj)
+                    End If
+                Next
+            End If
+        End If
+    Next
+End Sub
+
+Sub AppendSearchInventory(doc, rows, report)
+    ListAdd report, ""
+    ListAdd report, "=== C) Search inventory ==="
+
+    Call AppendSearchQueryReport(doc, report, "Name=*Weld*,all")
+    Call AppendSearchQueryReport(doc, report, "Name=*Symbol*,all")
+    Call AppendSearchQueryReport(doc, report, "Name=*Annotation*,all")
+    Call AppendSearchQueryReport(doc, report, "Type=Annotation,all")
+    Call AppendSearchQueryReport(doc, report, "Type=DrawingText,all")
+
+    Dim i
+    Dim weldID
+    For i = 0 To rows.Count - 1
+        weldID = DictValue(rows.Item(i), "WeldID")
+        If weldID <> "" Then Call AppendSearchQueryReport(doc, report, "Name=*" & weldID & "*,all")
+    Next
+End Sub
+
+Sub AppendSearchQueryReport(doc, report, queryText)
+    Dim resultCount
+    Dim errorText
+    Dim firstObj
+
+    Set firstObj = SearchFirstObject(doc, queryText, resultCount, errorText)
+
+    If errorText <> "" Then
+        ListAdd report, "Search: " & queryText & " | ERROR: " & errorText
+    Else
+        ListAdd report, "Search: " & queryText & " | Count: " & CStr(resultCount)
+        If Not firstObj Is Nothing Then
+            ListAdd report, "  First candidate: " & SafeObjectName(firstObj) & " | TypeName: " & SafeTypeName(firstObj)
+        End If
+    End If
+End Sub
+
 Function PlaceLabelForRecord(doc, rec, report, ByRef nativeUpdated, ByRef textFallback)
     PlaceLabelForRecord = False
 
@@ -96,60 +231,168 @@ Function PlaceLabelForRecord(doc, rec, report, ByRef nativeUpdated, ByRef textFa
     If weldID = "" Then weldID = "W" & Right("000" & CStr(CLngOrZero(jointIndex)), 3)
     If symbolName = "" And jointIndex <> "" Then symbolName = "Weld Symbol." & CStr(CLngOrZero(jointIndex))
 
+    ListAdd report, "=== " & weldID & " ==="
+    ListAdd report, "Register WeldSymbolName: " & EmptyAsText(symbolName)
+    ListAdd report, "AssemblyJointIndex: " & EmptyAsText(jointIndex)
+    ListAdd report, "Expected symbol names:"
+    ListAdd report, "  " & EmptyAsText(symbolName)
+    If jointIndex <> "" Then
+        ListAdd report, "  Weld Symbol." & CStr(CLngOrZero(jointIndex))
+        ListAdd report, "  *Weld Symbol." & CStr(CLngOrZero(jointIndex)) & "*"
+        ListAdd report, "  *Weld*" & CStr(CLngOrZero(jointIndex)) & "*"
+        ListAdd report, "  *Symbol*" & CStr(CLngOrZero(jointIndex)) & "*"
+    End If
+
     If weldID = "" Or symbolName = "" Then
-        ListAdd report, weldID & " label not placed: missing WeldID or WeldSymbolName"
+        ListAdd report, "Search exact result: skipped"
+        ListAdd report, "Search wildcard result: skipped"
+        ListAdd report, "Candidate object: <none>"
+        ListAdd report, "Candidate TypeName: <none>"
+        ListAdd report, "Native update attempt: skipped"
+        ListAdd report, "Text fallback attempt: skipped"
+        ListAdd report, "Reason if failed: missing WeldID or WeldSymbolName"
+        ListAdd report, "Final status: UNPLACED"
         Exit Function
     End If
 
+    Dim exactCount
+    Dim exactError
+    Dim wildcardCount
+    Dim wildcardError
     Dim symbolObj
-    Set symbolObj = FindObjectByName(doc, symbolName)
+    Set symbolObj = SearchFirstObject(doc, "Name=" & CStr(symbolName) & ",all", exactCount, exactError)
+    If exactError <> "" Then
+        ListAdd report, "Search exact result: ERROR: " & exactError
+    Else
+        ListAdd report, "Search exact result: " & CStr(exactCount)
+    End If
+
     If symbolObj Is Nothing Then
-        ListAdd report, weldID & " label not placed: " & symbolName & " not found in drawing"
+        Set symbolObj = SearchFirstObject(doc, "Name=*" & CStr(symbolName) & "*,all", wildcardCount, wildcardError)
+    Else
+        wildcardCount = 0
+        wildcardError = ""
+    End If
+
+    If wildcardError <> "" Then
+        ListAdd report, "Search wildcard result: ERROR: " & wildcardError
+    ElseIf wildcardCount > 0 Then
+        ListAdd report, "Search wildcard result: " & CStr(wildcardCount)
+    ElseIf exactCount > 0 Then
+        ListAdd report, "Search wildcard result: not needed"
+    Else
+        ListAdd report, "Search wildcard result: 0"
+    End If
+
+    If symbolObj Is Nothing And jointIndex <> "" Then
+        Set symbolObj = SearchFirstObject(doc, "Name=*Weld*" & CStr(CLngOrZero(jointIndex)) & "*,all", wildcardCount, wildcardError)
+        ListAdd report, "Search *Weld*" & CStr(CLngOrZero(jointIndex)) & "* result: " & SearchResultText(wildcardCount, wildcardError)
+    End If
+
+    If symbolObj Is Nothing And jointIndex <> "" Then
+        Set symbolObj = SearchFirstObject(doc, "Name=*Symbol*" & CStr(CLngOrZero(jointIndex)) & "*,all", wildcardCount, wildcardError)
+        ListAdd report, "Search *Symbol*" & CStr(CLngOrZero(jointIndex)) & "* result: " & SearchResultText(wildcardCount, wildcardError)
+    End If
+
+    If symbolObj Is Nothing Then
+        ListAdd report, "Candidate object: <none>"
+        ListAdd report, "Candidate TypeName: <none>"
+        ListAdd report, "Native update attempt: skipped"
+        ListAdd report, "Text fallback attempt: skipped"
+        ListAdd report, "Reason if failed: " & symbolName & " not found in drawing"
+        ListAdd report, "Final status: UNPLACED"
         Exit Function
     End If
 
-    If TryUpdateNativeSymbol(symbolObj, weldID) Then
+    ListAdd report, "Candidate object: " & SafeObjectName(symbolObj)
+    ListAdd report, "Candidate TypeName: " & SafeTypeName(symbolObj)
+
+    Dim nativeDetail
+    If TryUpdateNativeSymbolWithDetail(symbolObj, weldID, nativeDetail) Then
         nativeUpdated = nativeUpdated + 1
-        ListAdd report, weldID & " updated in native symbol: " & symbolName
+        ListAdd report, "Native update attempt: success - " & nativeDetail
+        ListAdd report, "Text fallback attempt: not needed"
+        ListAdd report, "Reason if failed: <none>"
+        ListAdd report, "Final status: PLACED_NATIVE"
         PlaceLabelForRecord = True
         Exit Function
     End If
+    ListAdd report, "Native update attempt: failed - " & nativeDetail
 
-    If TryPlaceTextNearSymbol(symbolObj, weldID) Then
+    Dim textDetail
+    If TryPlaceTextNearSymbolWithDetail(symbolObj, weldID, textDetail) Then
         textFallback = textFallback + 1
-        ListAdd report, weldID & " placed as text fallback near: " & symbolName
+        ListAdd report, "Text fallback attempt: success - " & textDetail
+        ListAdd report, "Reason if failed: <none>"
+        ListAdd report, "Final status: PLACED_TEXT_FALLBACK"
         PlaceLabelForRecord = True
         Exit Function
     End If
+    ListAdd report, "Text fallback attempt: failed - " & textDetail
 
-    ListAdd report, weldID & " label not placed: symbol found but text/position is not accessible"
+    ListAdd report, "Reason if failed: symbol found but native fields/text position are not accessible"
+    ListAdd report, "Final status: UNPLACED"
+End Function
+
+Function SearchResultText(resultCount, errorText)
+    If CStr(errorText) <> "" Then
+        SearchResultText = "ERROR: " & CStr(errorText)
+    Else
+        SearchResultText = CStr(resultCount)
+    End If
+End Function
+
+Function SearchFirstObject(doc, queryText, ByRef resultCount, ByRef errorText)
+    Set SearchFirstObject = Nothing
+    resultCount = 0
+    errorText = ""
+
+    Dim sel
+    Set sel = Nothing
+
+    On Error Resume Next
+    Set sel = doc.Selection
+    If Err.Number <> 0 Or sel Is Nothing Then
+        errorText = Err.Description
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    sel.Clear
+    Err.Clear
+    sel.Search CStr(queryText)
+    If Err.Number <> 0 Then
+        errorText = Err.Description
+        Err.Clear
+    Else
+        resultCount = SelectionCount(sel)
+        If resultCount > 0 Then Set SearchFirstObject = SelectionItemValue(sel, 1)
+    End If
+    sel.Clear
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
 End Function
 
 Function FindObjectByName(doc, objectName)
     Set FindObjectByName = Nothing
 
-    Dim sel
-    Set sel = doc.Selection
-
-    On Error Resume Next
-    sel.Clear
-    Err.Clear
-    sel.Search "Name=" & CStr(objectName) & ",all"
-    If Err.Number <> 0 Or SelectionCount(sel) = 0 Then
-        Err.Clear
-        sel.Clear
-        sel.Search "Name=*" & CStr(objectName) & "*,all"
+    Dim resultCount
+    Dim errorText
+    Set FindObjectByName = SearchFirstObject(doc, "Name=" & CStr(objectName) & ",all", resultCount, errorText)
+    If FindObjectByName Is Nothing Then
+        Set FindObjectByName = SearchFirstObject(doc, "Name=*" & CStr(objectName) & "*,all", resultCount, errorText)
     End If
-    If Err.Number = 0 And SelectionCount(sel) > 0 Then
-        Set FindObjectByName = SelectionItemValue(sel, 1)
-    End If
-    Err.Clear
-    sel.Clear
-    On Error GoTo 0
 End Function
 
 Function TryUpdateNativeSymbol(symbolObj, weldID)
-    TryUpdateNativeSymbol = False
+    Dim detailText
+    TryUpdateNativeSymbol = TryUpdateNativeSymbolWithDetail(symbolObj, weldID, detailText)
+End Function
+
+Function TryUpdateNativeSymbolWithDetail(symbolObj, weldID, ByRef detailText)
+    TryUpdateNativeSymbolWithDetail = False
+    detailText = "no native writable field found"
 
     Dim props
     props = Array("PrimarySize", "PrimaryWeldSize", "Size", "Text", "TextString", "Value", "String")
@@ -157,7 +400,8 @@ Function TryUpdateNativeSymbol(symbolObj, weldID)
     Dim i
     For i = LBound(props) To UBound(props)
         If TrySetScalarProperty(symbolObj, CStr(props(i)), weldID) Then
-            TryUpdateNativeSymbol = True
+            detailText = "wrote " & CStr(props(i))
+            TryUpdateNativeSymbolWithDetail = True
             Exit Function
         End If
     Next
@@ -179,17 +423,29 @@ Function TrySetScalarProperty(obj, propertyName, value)
 End Function
 
 Function TryPlaceTextNearSymbol(symbolObj, weldID)
-    TryPlaceTextNearSymbol = False
+    Dim detailText
+    TryPlaceTextNearSymbol = TryPlaceTextNearSymbolWithDetail(symbolObj, weldID, detailText)
+End Function
+
+Function TryPlaceTextNearSymbolWithDetail(symbolObj, weldID, ByRef detailText)
+    TryPlaceTextNearSymbolWithDetail = False
+    detailText = ""
 
     Dim view
     Set view = ViewWithTexts(symbolObj)
-    If view Is Nothing Then Exit Function
+    If view Is Nothing Then
+        detailText = "parent DrawingView with Texts collection not accessible"
+        Exit Function
+    End If
 
     Dim x
     Dim y
     x = ProbeDouble(symbolObj, "X")
     y = ProbeDouble(symbolObj, "Y")
-    If x = "" Or y = "" Then Exit Function
+    If x = "" Or y = "" Then
+        detailText = "symbol X/Y position not accessible"
+        Exit Function
+    End If
 
     Dim txt
     Set txt = Nothing
@@ -198,7 +454,11 @@ Function TryPlaceTextNearSymbol(symbolObj, weldID)
     If Err.Number = 0 And Not txt Is Nothing Then
         txt.Name = "LABEL_" & CStr(weldID)
         txt.SetFontSize 0, 0, 3.5
-        TryPlaceTextNearSymbol = True
+        detailText = "created LABEL_" & CStr(weldID) & " on view " & SafeObjectName(view)
+        TryPlaceTextNearSymbolWithDetail = True
+    Else
+        detailText = "Texts.Add failed"
+        If Err.Number <> 0 Then detailText = detailText & ": " & Err.Description
     End If
     If Err.Number <> 0 Then Err.Clear
     On Error GoTo 0
@@ -469,6 +729,141 @@ End Sub
 ' ---------------------------------------------------------------------------
 ' Generic helpers
 ' ---------------------------------------------------------------------------
+
+Function EmptyAsText(value)
+    If Trim(CStr(value)) = "" Then
+        EmptyAsText = "<empty>"
+    Else
+        EmptyAsText = CStr(value)
+    End If
+End Function
+
+Function SafeObjectName(obj)
+    SafeObjectName = "<not accessible>"
+    If obj Is Nothing Then
+        SafeObjectName = "<none>"
+        Exit Function
+    End If
+
+    On Error Resume Next
+    SafeObjectName = CStr(obj.Name)
+    If Err.Number <> 0 Or Trim(CStr(SafeObjectName)) = "" Then
+        Err.Clear
+        SafeObjectName = "<unnamed>"
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeTypeName(obj)
+    SafeTypeName = "<not accessible>"
+    If obj Is Nothing Then
+        SafeTypeName = "<none>"
+        Exit Function
+    End If
+
+    On Error Resume Next
+    SafeTypeName = TypeName(obj)
+    If Err.Number <> 0 Or Trim(CStr(SafeTypeName)) = "" Then
+        Err.Clear
+        SafeTypeName = "<not accessible>"
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeScalarProperty(obj, propertyName)
+    SafeScalarProperty = "<not accessible>"
+    If obj Is Nothing Then Exit Function
+    If Not IsAutomationIdentifier(propertyName) Then Exit Function
+
+    Dim propertyValue
+    On Error Resume Next
+    propertyValue = Eval("obj." & CStr(propertyName))
+    If Err.Number = 0 Then
+        SafeScalarProperty = CStr(propertyValue)
+        If Trim(CStr(SafeScalarProperty)) = "" Then SafeScalarProperty = "<empty>"
+    Else
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeCollectionCount(collectionObj)
+    SafeCollectionCount = 0
+    If collectionObj Is Nothing Then Exit Function
+
+    On Error Resume Next
+    SafeCollectionCount = CLng(collectionObj.Count)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SafeCollectionCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeChildCollectionCount(obj, collectionName)
+    SafeChildCollectionCount = "<not accessible>"
+    If obj Is Nothing Then Exit Function
+    If Not IsAutomationIdentifier(collectionName) Then Exit Function
+
+    Dim childCollection
+    Set childCollection = Nothing
+
+    On Error Resume Next
+    Execute "Set childCollection = obj." & CStr(collectionName)
+    If Err.Number = 0 And Not childCollection Is Nothing Then
+        SafeChildCollectionCount = CStr(SafeCollectionCount(childCollection))
+    Else
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+Function ViewGenerativeLinkInfo(viewObj)
+    ViewGenerativeLinkInfo = "<not accessible>"
+    If viewObj Is Nothing Then Exit Function
+
+    Dim behaviorObj
+    Dim linkedDoc
+    Set behaviorObj = Nothing
+    Set linkedDoc = Nothing
+
+    On Error Resume Next
+    Set behaviorObj = viewObj.GenerativeBehavior
+    If Err.Number <> 0 Or behaviorObj Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Set linkedDoc = behaviorObj.Document
+    If Err.Number <> 0 Or linkedDoc Is Nothing Then
+        Err.Clear
+        Set linkedDoc = behaviorObj.ReferenceDocument
+    End If
+
+    If Err.Number = 0 And Not linkedDoc Is Nothing Then
+        ViewGenerativeLinkInfo = SafeObjectName(linkedDoc) & " | " & SafeFullName(linkedDoc)
+    Else
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+Function SafeFullName(docObj)
+    SafeFullName = "<not accessible>"
+    If docObj Is Nothing Then
+        SafeFullName = "<none>"
+        Exit Function
+    End If
+
+    On Error Resume Next
+    SafeFullName = CStr(docObj.FullName)
+    If Err.Number <> 0 Or Trim(CStr(SafeFullName)) = "" Then
+        Err.Clear
+        SafeFullName = "<not accessible>"
+    End If
+    On Error GoTo 0
+End Function
 
 Function NewDictionary()
     Dim d
